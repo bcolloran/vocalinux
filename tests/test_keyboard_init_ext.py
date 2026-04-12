@@ -185,7 +185,9 @@ class TestCreateBackendPreferred:
                 result = create_backend(
                     preferred_backend="pynput", shortcut="alt+alt", mode="push_to_talk"
                 )
-                mock_constructor.assert_called_once_with(shortcut="alt+alt", mode="push_to_talk")
+                mock_constructor.assert_called_once_with(
+                    shortcut="alt+alt", mode="push_to_talk", min_hold_ms=500
+                )
                 assert result == mock_pynput_backend
 
     def test_create_backend_preferred_with_custom_mode(self):
@@ -313,7 +315,7 @@ class TestCreateBackendAutoDetect:
                 ) as mock_constructor:
                     result = create_backend(shortcut="alt+alt", mode="push_to_talk")
                     mock_constructor.assert_called_once_with(
-                        shortcut="alt+alt", mode="push_to_talk"
+                        shortcut="alt+alt", mode="push_to_talk", min_hold_ms=500
                     )
 
     def test_create_backend_default_parameters(self):
