@@ -551,6 +551,7 @@ class TestPynputKeyboardBackendModifierMatching:
         mock_variants.get.return_value = {MockKey.alt_r, MockKey.alt_gr}
 
         backend._on_press(MockKey.alt_gr)
+        backend._on_press(MockKey.alt_gr)
         time.sleep(0.1)
 
         assert callback.called
@@ -566,6 +567,47 @@ class TestPynputKeyboardBackendModifierMatching:
         backend._normalize_modifier_key = MagicMock(return_value=MockKey.alt)
 
         backend._on_press(MockKey.alt_r)
+        backend._on_press(MockKey.alt_r)
         time.sleep(0.1)
 
         assert callback.called
+
+
+class TestPynputKeyboardBackendFsmBehavior:
+    """Test double-tap-and-hold FSM behavior in push_to_talk mode."""
+
+    def test_double_tap_and_hold_finalizes_when_threshold_met(self):
+        backend = PynputKeyboardBackend(mode="push_to_talk", min_hold_ms=500)
+        press_callback = MagicMock()
+        release_callback = MagicMock()
+        backend.register_press_callback(press_callback)
+        backend.register_release_callback(release_callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+
+        with patch("vocalinux.ui.keyboard_backends.pynput_backend.time.time") as mock_time:
+            mock_time.side_effect = [1.0, 1.2, 1.9]
+            backend._on_press(MockKey.ctrl)
+            backend._on_press(MockKey.ctrl)
+            backend._on_release(MockKey.ctrl)
+
+        time.sleep(0.1)
+        assert press_callback.called
+        assert release_callback.called
+
+    def test_double_tap_short_hold_does_not_finalize(self):
+        backend = PynputKeyboardBackend(mode="push_to_talk", min_hold_ms=500)
+        press_callback = MagicMock()
+        release_callback = MagicMock()
+        backend.register_press_callback(press_callback)
+        backend.register_release_callback(release_callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+
+        with patch("vocalinux.ui.keyboard_backends.pynput_backend.time.time") as mock_time:
+            mock_time.side_effect = [2.0, 2.2, 2.5]
+            backend._on_press(MockKey.ctrl)
+            backend._on_press(MockKey.ctrl)
+            backend._on_release(MockKey.ctrl)
+
+        time.sleep(0.1)
+        assert press_callback.called
+        assert release_callback.call_count == 0

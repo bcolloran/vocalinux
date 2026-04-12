@@ -1181,7 +1181,7 @@ class SettingsDialog(Gtk.Dialog):
         self.shortcut_mode_combo = Gtk.ComboBoxText()
         self.shortcut_mode_combo.set_size_request(200, -1)
         self.shortcut_mode_combo.set_tooltip_text(
-            "Choose between toggle (double-tap) or push-to-talk mode"
+            "Choose between toggle mode or double-tap-and-hold mode"
         )
         _prevent_scroll_on_hover(self.shortcut_mode_combo)
 
@@ -1200,6 +1200,21 @@ class SettingsDialog(Gtk.Dialog):
             widget=self.shortcut_mode_combo,
         )
         group.add_row(mode_row)
+
+        self.shortcut_min_hold_spin = Gtk.SpinButton()
+        self.shortcut_min_hold_spin.set_range(0, 5000)
+        self.shortcut_min_hold_spin.set_increments(50, 100)
+        self.shortcut_min_hold_spin.set_digits(0)
+        self.shortcut_min_hold_spin.set_size_request(120, -1)
+        _prevent_scroll_on_hover(self.shortcut_min_hold_spin)
+        current_min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
+        self.shortcut_min_hold_spin.set_value(current_min_hold_ms)
+        min_hold_row = PreferenceRow(
+            title="Minimum Hold (ms)",
+            subtitle="Required key hold time before release finalizes dictation",
+            widget=self.shortcut_min_hold_spin,
+        )
+        group.add_row(min_hold_row)
 
         # Shortcut selection combo
         self.shortcut_combo = Gtk.ComboBoxText()
@@ -1255,6 +1270,7 @@ class SettingsDialog(Gtk.Dialog):
         # Connect signals
         self.shortcut_combo.connect("changed", self._on_shortcut_changed)
         self.shortcut_mode_combo.connect("changed", self._on_shortcut_mode_changed)
+        self.shortcut_min_hold_spin.connect("value-changed", self._on_shortcut_min_hold_changed)
 
         # Update UI based on initial mode
         self._update_shortcut_ui_for_mode(current_mode)
@@ -1267,9 +1283,12 @@ class SettingsDialog(Gtk.Dialog):
                 "In Toggle mode: Double-tap the key to start voice typing, double-tap again to stop."
             )
         elif mode == "push_to_talk":
-            self.shortcut_row.set_subtitle("Hold this key to speak, release to stop")
+            self.shortcut_row.set_subtitle(
+                "Double-tap, keep holding to record, release to finalize"
+            )
             self.shortcut_info_label.set_text(
-                "In Push-to-Talk mode: Hold the key down to speak, release to stop recording."
+                "In Double-Tap and Hold mode: double-tap to arm, keep holding while speaking, "
+                "then release to finalize if the hold threshold is met."
             )
 
     def _on_shortcut_mode_changed(self, widget):
@@ -1294,7 +1313,8 @@ class SettingsDialog(Gtk.Dialog):
         # Try to apply the mode change live
         if self.shortcut_update_callback:
             shortcut_id = self.shortcut_combo.get_active_id()
-            success = self.shortcut_update_callback(shortcut_id, mode_id)
+            min_hold_ms = int(self.shortcut_min_hold_spin.get_value())
+            success = self.shortcut_update_callback(shortcut_id, mode_id, min_hold_ms)
             if success:
                 self.shortcut_info_label.set_markup(
                     f"<span foreground='#26a269'>Mode updated to <b>{mode_name}</b>. "
@@ -1337,7 +1357,8 @@ class SettingsDialog(Gtk.Dialog):
         # Try to apply the shortcut change live
         if self.shortcut_update_callback:
             mode_id = self.shortcut_mode_combo.get_active_id()
-            success = self.shortcut_update_callback(shortcut_id, mode_id)
+            min_hold_ms = int(self.shortcut_min_hold_spin.get_value())
+            success = self.shortcut_update_callback(shortcut_id, mode_id, min_hold_ms)
             if success:
                 self.shortcut_info_label.set_markup(
                     f"<span foreground='#26a269'>Shortcut updated to <b>{display_name}</b>. "
@@ -1353,6 +1374,31 @@ class SettingsDialog(Gtk.Dialog):
                 f"<i>Shortcut updated to <b>{display_name}</b>. "
                 f"Restart the app for the change to take full effect.</i>"
             )
+
+    def _on_shortcut_min_hold_changed(self, widget):
+        """Handle minimum hold threshold changes."""
+        if self._initializing:
+            return
+
+        min_hold_ms = int(self.shortcut_min_hold_spin.get_value())
+        self.config_manager.set("shortcuts", "min_hold_ms", min_hold_ms)
+        self.config_manager.save_settings()
+        logger.info(f"Keyboard shortcut minimum hold changed to: {min_hold_ms}ms")
+
+        if self.shortcut_update_callback:
+            shortcut_id = self.shortcut_combo.get_active_id()
+            mode_id = self.shortcut_mode_combo.get_active_id()
+            success = self.shortcut_update_callback(shortcut_id, mode_id, min_hold_ms)
+            if success:
+                self.shortcut_info_label.set_markup(
+                    f"<span foreground='#26a269'>Minimum hold updated to "
+                    f"<b>{min_hold_ms}ms</b>. Active now!</span>"
+                )
+            else:
+                self.shortcut_info_label.set_markup(
+                    f"<i>Minimum hold updated to <b>{min_hold_ms}ms</b>. "
+                    f"Restart the app for the change to take full effect.</i>"
+                )
 
     def _build_test_section(self):
         """Build the Test Recognition section."""

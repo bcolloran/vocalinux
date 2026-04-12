@@ -83,9 +83,14 @@ class TrayIndicator:
         # Get configured shortcut and mode from config
         shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", "ctrl+ctrl")
         mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
 
         # Initialize keyboard shortcut manager with configured shortcut and mode
-        self.shortcut_manager = KeyboardShortcutManager(shortcut=shortcut, mode=mode)
+        self.shortcut_manager = KeyboardShortcutManager(
+            shortcut=shortcut,
+            mode=mode,
+            min_hold_ms=min_hold_ms,
+        )
 
         # Ensure icon directory exists
         os.makedirs(ICON_DIR, exist_ok=True)
@@ -134,6 +139,8 @@ class TrayIndicator:
 
         # Get configured mode from config
         mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
+        self.shortcut_manager.set_min_hold_ms(min_hold_ms)
         logger.info(f"Setting up keyboard shortcuts with mode: {mode}")
 
         if mode == "toggle":
@@ -496,7 +503,12 @@ class TrayIndicator:
             logger.info("Settings dialog closed.")
             dialog.destroy()
 
-    def update_shortcut(self, shortcut: str, mode: Optional[str] = None) -> bool:
+    def update_shortcut(
+        self,
+        shortcut: str,
+        mode: Optional[str] = None,
+        min_hold_ms: Optional[int] = None,
+    ) -> bool:
         """
         Update the keyboard shortcut for toggling voice recognition.
 
@@ -505,6 +517,7 @@ class TrayIndicator:
         Args:
             shortcut: The new shortcut string (e.g., "ctrl+ctrl", "alt+alt")
             mode: Optional new mode ("toggle" or "push_to_talk"). If None, keeps current mode.
+            min_hold_ms: Optional minimum hold duration in milliseconds.
 
         Returns:
             True if the shortcut was updated successfully, False otherwise
@@ -512,6 +525,9 @@ class TrayIndicator:
         current_mode = self.shortcut_manager.mode
         mode_changed = mode is not None and mode != current_mode
         shortcut_changed = shortcut != self.shortcut_manager.shortcut
+        hold_threshold_changed = (
+            min_hold_ms is not None and min_hold_ms != self.shortcut_manager.min_hold_ms
+        )
 
         if mode_changed:
             logger.info(f"Mode changing from {current_mode} to {mode}")
@@ -525,11 +541,17 @@ class TrayIndicator:
                 logger.error(f"Failed to set shortcut: {shortcut}")
                 return False
 
+        if hold_threshold_changed:
+            assert min_hold_ms is not None
+            if not self.shortcut_manager.set_min_hold_ms(min_hold_ms):
+                logger.error(f"Failed to set min_hold_ms: {min_hold_ms}")
+                return False
+
         if mode_changed or shortcut_changed:
             self._setup_keyboard_shortcuts()
             return self.shortcut_manager.active
 
-        logger.debug("No changes needed - shortcut and mode unchanged")
+        logger.debug("No keyboard listener restart needed")
         return True
 
     def _on_about_clicked(self, widget):
