@@ -370,6 +370,8 @@ def test_audio_input(device_index: int = None, duration: float = 1.0) -> dict:
 
 logger = logging.getLogger(__name__)
 
+PREVIEW_THROTTLE_SECONDS = 0.2
+
 
 def _filter_non_speech(text: str) -> str:
     """
@@ -539,8 +541,11 @@ class SpeechRecognitionManager:
         self._voice_commands_enabled = self._resolve_voice_commands_enabled()
 
         self.text_callbacks: list[Callable[[str], None]] = []
+        self.preview_callbacks: list[Callable[[str], None]] = []
         self.state_callbacks: list[Callable[[RecognitionState], None]] = []
         self.action_callbacks: list[Callable[[str], None]] = []
+        self._preview_last_emit_time = 0.0
+        self._preview_last_text = ""
 
         # Download progress tracking
         self._download_progress_callback: Optional[Callable[[float, float, str], None]] = None
@@ -1421,6 +1426,28 @@ class SpeechRecognitionManager:
         """
         self.text_callbacks.append(callback)
 
+    def register_preview_callback(self, callback: Callable[[str], None]):
+        """
+        Register a callback function for incremental preview text updates.
+
+        Args:
+            callback: A function that takes a string argument (preview text)
+        """
+        self.preview_callbacks.append(callback)
+
+    def unregister_preview_callback(self, callback: Callable[[str], None]):
+        """
+        Unregister a preview callback function.
+
+        Args:
+            callback: The callback function to remove.
+        """
+        try:
+            self.preview_callbacks.remove(callback)
+            logger.debug(f"Unregistered preview callback: {callback}")
+        except ValueError:
+            logger.warning(f"Callback {callback} not found in preview_callbacks.")
+
     def unregister_text_callback(self, callback: Callable[[str], None]):
         """
         Unregister a text callback function.
@@ -1508,8 +1535,66 @@ class SpeechRecognitionManager:
             new_state: The new recognition state
         """
         self.state = new_state
+        if new_state != RecognitionState.LISTENING:
+            self._emit_preview_text("")
         for callback in self.state_callbacks:
             callback(new_state)
+
+    def _transcribe_preview_text(self, audio_buffer: list[bytes]) -> str:
+        """Transcribe in-progress audio for UI preview (no command processing)."""
+        if not audio_buffer:
+            return ""
+
+        if self.engine == "vosk":
+            with self._model_lock:
+                if self.model is None:
+                    return ""
+                try:
+                    from vosk import KaldiRecognizer
+
+                    recognizer = KaldiRecognizer(self.model, 16000)
+                    for data in audio_buffer:
+                        recognizer.AcceptWaveform(data)
+                    result = json.loads(recognizer.FinalResult())
+                    return result.get("text", "").strip()
+                except Exception as e:
+                    logger.debug(f"Failed to generate VOSK preview: {e}")
+                    return ""
+
+        if self.engine == "whisper":
+            return self._transcribe_with_whisper(audio_buffer).strip()
+
+        if self.engine == "whisper_cpp":
+            return self._transcribe_with_whispercpp(audio_buffer).strip()
+
+        return ""
+
+    def _emit_preview_text(self, preview_text: str):
+        """Emit preview text to subscribers, skipping duplicate payloads."""
+        if preview_text == self._preview_last_text:
+            return
+
+        self._preview_last_text = preview_text
+        for callback in self.preview_callbacks:
+            try:
+                callback(preview_text)
+            except Exception as e:
+                logger.debug(f"Preview callback error: {e}")
+
+    def _maybe_emit_preview_text(self):
+        """Emit throttled preview updates for the active segment."""
+        if not self.preview_callbacks:
+            return
+
+        now = time.monotonic()
+        if now - self._preview_last_emit_time < PREVIEW_THROTTLE_SECONDS:
+            return
+
+        with self._buffer_lock:
+            preview_buffer = self.audio_buffer.copy()
+        preview_text = self._transcribe_preview_text(preview_buffer)
+        self._emit_preview_text(preview_text)
+        self._preview_last_emit_time = now
 
     @property
     def model_ready(self) -> bool:
@@ -1546,6 +1631,8 @@ class SpeechRecognitionManager:
         self._recognition_mode = mode
         self.audio_buffer = []
         self._segment_queue = queue.Queue(maxsize=32)
+        self._preview_last_emit_time = 0.0
+        self._preview_last_text = ""
 
         # Start the audio recording thread
         self.audio_thread = threading.Thread(target=self._record_audio)
@@ -1793,6 +1880,7 @@ class SpeechRecognitionManager:
                                     logger.debug("Silence detected, queueing audio segment")
                                     self._enqueue_audio_segment(self.audio_buffer)
                                     self.audio_buffer = []
+                                    self._emit_preview_text("")
                             silence_counter = 0
                     else:  # Speech
                         if not speech_detected_in_session:
@@ -1802,6 +1890,8 @@ class SpeechRecognitionManager:
                             )
                             speech_detected_in_session = True
                         silence_counter = 0
+
+                    self._maybe_emit_preview_text()
                 except (IOError, OSError) as e:
                     current_time = time.time()
                     logger.error(f"Audio device error: {e}")

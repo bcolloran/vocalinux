@@ -185,6 +185,12 @@ class TestCallbacks(unittest.TestCase):
         mgr.register_state_callback(cb)
         self.assertIn(cb, mgr.state_callbacks)
 
+    def test_register_preview_callback(self):
+        mgr = _make_manager()
+        cb = MagicMock()
+        mgr.register_preview_callback(cb)
+        self.assertIn(cb, mgr.preview_callbacks)
+
     def test_register_action_callback(self):
         mgr = _make_manager()
         cb = MagicMock()
@@ -204,6 +210,16 @@ class TestCallbacks(unittest.TestCase):
         mgr._update_state(RecognitionState.LISTENING)
         self.assertEqual(mgr.state, RecognitionState.LISTENING)
         cb.assert_called_with(RecognitionState.LISTENING)
+
+    def test_emit_preview_text_deduplicates(self):
+        mgr = _make_manager()
+        cb = MagicMock()
+        mgr.register_preview_callback(cb)
+        mgr._emit_preview_text("hello")
+        mgr._emit_preview_text("hello")
+        mgr._emit_preview_text("hello world")
+        self.assertEqual(cb.call_count, 2)
+        cb.assert_has_calls([call("hello"), call("hello world")])
 
 
 class TestCancelDownload(unittest.TestCase):

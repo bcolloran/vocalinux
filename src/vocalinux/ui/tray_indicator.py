@@ -104,6 +104,7 @@ class TrayIndicator:
 
         # Register for speech recognition state changes
         self.speech_engine.register_state_callback(self._on_recognition_state_changed)
+        self.speech_engine.register_preview_callback(self._on_preview_text_changed)
 
         # Initialize the icon files and validate resources
         self._init_icons()
@@ -217,6 +218,8 @@ class TrayIndicator:
         # Add menu items
         self._add_menu_item("Start Voice Typing", self._on_start_clicked)
         self._add_menu_item("Stop Voice Typing", self._on_stop_clicked)
+        self.preview_menu_item = self._add_menu_item("Preview: ", self._on_preview_clicked)
+        self.preview_menu_item.set_sensitive(False)
         self._add_menu_separator()
 
         self._autostart_menu_item = self._add_menu_checkbox(
@@ -405,6 +408,24 @@ class TrayIndicator:
         # Update the UI in the GTK main thread
         GLib.idle_add(self._update_ui, state)
 
+    def _on_preview_text_changed(self, preview_text: str):
+        """Handle incremental preview text updates from the recognition thread."""
+        GLib.idle_add(self._update_preview_text, preview_text)
+
+    def _on_preview_clicked(self, widget):
+        """No-op callback for the preview menu item."""
+
+    def _update_preview_text(self, preview_text: str):
+        """Update preview text in tray menu on GTK main thread."""
+        if not hasattr(self, "preview_menu_item"):
+            return False
+
+        preview = preview_text.strip()
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        self.preview_menu_item.set_label(f"Preview: {preview}")
+        return False
+
     def _update_ui(self, state: RecognitionState):
         """
         Update the UI based on the recognition state.
@@ -419,6 +440,7 @@ class TrayIndicator:
             self.indicator.set_icon_full(self.icon_names["default"], "Microphone off")
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)
+            self._update_preview_text("")
         elif state == RecognitionState.LISTENING:
             self.indicator.set_icon_full(self.icon_names["active"], "Microphone on")
             self._set_menu_item_enabled("Start Voice Typing", False)
@@ -427,10 +449,12 @@ class TrayIndicator:
             self.indicator.set_icon_full(self.icon_names["processing"], "Processing speech")
             self._set_menu_item_enabled("Start Voice Typing", False)
             self._set_menu_item_enabled("Stop Voice Typing", True)
+            self._update_preview_text("")
         elif state == RecognitionState.ERROR:
             self.indicator.set_icon_full(self.icon_names["default"], "Error")
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)
+            self._update_preview_text("")
 
         return False  # Remove idle callback
 
