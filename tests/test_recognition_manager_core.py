@@ -590,6 +590,31 @@ class TestPushToTalkMode(unittest.TestCase):
         manager.stop_recognition()
         self.assertEqual(manager._recognition_mode, "toggle")
 
+    def test_push_to_talk_calls_finalize_once_per_release(self):
+        manager = SpeechRecognitionManager(engine="vosk")
+        manager.register_text_callback(MagicMock())
+        manager.audio_thread = self.threadInstance
+        manager.recognition_thread = self.threadInstance
+
+        with patch.object(manager, "finalize_session_text", return_value="hello") as finalize_mock:
+            manager.start_recognition(mode="push_to_talk")
+            manager.stop_recognition()
+            finalize_mock.assert_called_once()
+
+    def test_push_to_talk_release_injects_deterministic_finalized_text(self):
+        manager = SpeechRecognitionManager(engine="vosk")
+        callback = MagicMock()
+        manager.register_text_callback(callback)
+
+        manager.start_recognition(mode="push_to_talk")
+        manager._session_finalized_segments = ["  hello  ", "world ", " from test"]
+        manager.audio_thread = self.threadInstance
+        manager.recognition_thread = self.threadInstance
+
+        manager.stop_recognition()
+
+        callback.assert_called_once_with("hello world from test")
+
 
 class TestWhisperInitialization(unittest.TestCase):
     """Test cases for Whisper engine initialization."""
