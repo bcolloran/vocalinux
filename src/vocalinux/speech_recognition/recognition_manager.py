@@ -568,6 +568,8 @@ class SpeechRecognitionManager:
         self.should_record = False
         self._recognition_mode = "toggle"  # "toggle" or "push_to_talk"
         self.audio_buffer = []
+        self._session_finalized_segments: list[str] = []
+        self._session_audio_segments: list[list[bytes]] = []
         self._buffer_lock = threading.Lock()  # Thread safety for audio_buffer
         self._model_lock = threading.Lock()  # Thread safety for model/recognizer access
         self._segment_queue = queue.Queue(maxsize=32)
@@ -1630,6 +1632,8 @@ class SpeechRecognitionManager:
         self.should_record = True
         self._recognition_mode = mode
         self.audio_buffer = []
+        self._session_finalized_segments = []
+        self._session_audio_segments = []
         self._segment_queue = queue.Queue(maxsize=32)
         self._preview_last_emit_time = 0.0
         self._preview_last_text = ""
@@ -1693,8 +1697,34 @@ class SpeechRecognitionManager:
         if self.recognition_thread and self.recognition_thread.is_alive():
             self.recognition_thread.join(timeout=1.0)
 
+        if self._recognition_mode == "push_to_talk":
+            finalized_text = self.finalize_session_text(
+                raw_session_audio_reference=self._session_audio_segments
+            )
+            if finalized_text:
+                for callback in self.text_callbacks:
+                    callback(finalized_text)
+
+        self._session_finalized_segments = []
+        self._session_audio_segments = []
         self._recognition_mode = "toggle"
         self._update_state(RecognitionState.IDLE)
+
+    def finalize_session_text(
+        self, raw_session_audio_reference: Optional[list[list[bytes]]] = None
+    ) -> str:
+        """Finalize the current session transcript into deterministic injection text.
+
+        Args:
+            raw_session_audio_reference: Raw session audio segments captured during the
+                session. Unused in MVP finalization, but accepted so a future phase can
+                run a full-session transcription without changing call sites.
+
+        Returns:
+            A single text string built from finalized per-window segments.
+        """
+        _ = raw_session_audio_reference
+        return " ".join(segment.strip() for segment in self._session_finalized_segments if segment)
 
     def _record_audio(self):
         """Record audio from the microphone with reconnection logic."""
@@ -1969,6 +1999,9 @@ class SpeechRecognitionManager:
         if not audio_buffer:
             return
 
+        if self._recognition_mode == "push_to_talk":
+            self._session_audio_segments.append(audio_buffer.copy())
+
         if self.engine == "vosk":
             # Lock recognizer access to prevent race condition with reconfigure
             with self._model_lock:
@@ -2010,11 +2043,14 @@ class SpeechRecognitionManager:
                 f"DEBUG: processed_text='{processed_text[:50] if processed_text else '(empty)'}...', callbacks={len(self.text_callbacks)}"
             )
             if processed_text:
-                for callback in self.text_callbacks:
-                    logger.info(
-                        f"DEBUG: invoking text callback: {callback.__name__ if hasattr(callback, '__name__') else callback}"
-                    )
-                    callback(processed_text)
+                if self._recognition_mode == "push_to_talk":
+                    self._session_finalized_segments.append(processed_text)
+                else:
+                    for callback in self.text_callbacks:
+                        logger.info(
+                            f"DEBUG: invoking text callback: {callback.__name__ if hasattr(callback, '__name__') else callback}"
+                        )
+                        callback(processed_text)
 
             # Call action callbacks for each action
             for action in actions:
