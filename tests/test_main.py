@@ -3,6 +3,7 @@ Tests for the main module functionality.
 """
 
 import argparse
+import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -716,6 +717,16 @@ class TestTextCallbackSpacing(unittest.TestCase):
         cb("World")
         calls = [c.args[0] for c in text_system.inject_text.call_args_list]
         self.assertEqual(calls, ["Hello.", " World"])
+
+    def test_feature_flag_off_preserves_immediate_injection_behavior(self):
+        """Feature-flag OFF path keeps legacy immediate per-segment injection."""
+        with patch.dict(os.environ, {"VOCALINUX_DEFERRED_INJECTION": "0"}, clear=False):
+            cb, text_system, _ = self._make_callback()
+            cb("alpha")
+            cb("beta")
+
+        calls = [c.args[0] for c in text_system.inject_text.call_args_list]
+        self.assertEqual(calls, ["alpha", " beta"])
 
 
 if __name__ == "__main__":

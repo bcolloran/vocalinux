@@ -590,6 +590,43 @@ class TestPushToTalkMode(unittest.TestCase):
         manager.stop_recognition()
         self.assertEqual(manager._recognition_mode, "toggle")
 
+    def test_push_to_talk_stop_aggregates_deferred_session_into_single_segment(self):
+        """Push-to-talk stop should enqueue one aggregated final segment."""
+        manager = SpeechRecognitionManager(engine="vosk")
+        manager.start_recognition(mode="push_to_talk")
+        manager.state = RecognitionState.LISTENING
+
+        manager.audio_thread = self.threadInstance
+        manager.recognition_thread = self.threadInstance
+        manager._enqueue_audio_segment = MagicMock()
+
+        # >15 chunks keeps pre-feedback chunks and drops trailing 15 chunks
+        manager.audio_buffer = [f"chunk-{i}".encode() for i in range(20)]
+        manager.stop_recognition()
+
+        manager._enqueue_audio_segment.assert_called_once()
+        enqueued_segment = manager._enqueue_audio_segment.call_args.args[0]
+        self.assertEqual(enqueued_segment, [f"chunk-{i}".encode() for i in range(5)])
+
+    def test_recognition_loop_emits_text_callback_once_per_segment(self):
+        """Recognition processing cadence emits one callback per queued segment."""
+        manager = SpeechRecognitionManager(engine="vosk")
+        manager.engine = "whisper"
+        manager.model = MagicMock()  # mark model ready for processing paths
+        manager._model_initialized = True
+        manager.should_record = False
+        manager._segment_queue.put([b"seg-a"])
+        manager._segment_queue.put([b"seg-b"])
+        manager._segment_queue.put(None)
+
+        callback = MagicMock()
+        manager.register_text_callback(callback)
+
+        with patch.object(manager, "_transcribe_with_whisper", side_effect=["one", "two"]):
+            manager._perform_recognition()
+
+        self.assertEqual(callback.call_args_list, [call("one"), call("two")])
+
 
 class TestWhisperInitialization(unittest.TestCase):
     """Test cases for Whisper engine initialization."""
