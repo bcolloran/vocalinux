@@ -82,6 +82,11 @@ WHISPER_MODEL_INFO = {
     "large": {"size_mb": 2900, "desc": "Highest accuracy, slowest", "params": "1550M"},
 }
 
+OUTPUT_MODES = {
+    "immediate": "Immediate (inject each finalized segment)",
+    "deferred_until_release": "Deferred until release (inject once on stop)",
+}
+
 
 def get_available_engines():
     """
@@ -1127,6 +1132,22 @@ class SettingsDialog(Gtk.Dialog):
         """Build the Recognition Settings section."""
         group = PreferencesGroup(title="Recognition Settings")
 
+        self.output_mode_combo = Gtk.ComboBoxText()
+        self.output_mode_combo.set_size_request(320, -1)
+        self.output_mode_combo.set_tooltip_text(
+            "Choose whether text is injected as segments finalize or once when recording stops."
+        )
+        _prevent_scroll_on_hover(self.output_mode_combo)
+        for mode, description in OUTPUT_MODES.items():
+            self.output_mode_combo.append(mode, description)
+
+        output_mode_row = PreferenceRow(
+            title="Output Mode",
+            subtitle="Immediate typing or deferred commit on release/stop",
+            widget=self.output_mode_combo,
+        )
+        group.add_row(output_mode_row)
+
         # VAD Sensitivity
         self.vad_spin = Gtk.SpinButton.new_with_range(1, 5, 1)
         self.vad_spin.set_tooltip_text("Higher = more sensitive to quiet speech")
@@ -1166,6 +1187,7 @@ class SettingsDialog(Gtk.Dialog):
         self.recognition_settings_tab.pack_start(group, False, False, 0)
 
         # Connect signals
+        self.output_mode_combo.connect("changed", self._on_output_mode_changed)
         self.vad_spin.connect("value-changed", self._on_vad_changed)
         self.silence_spin.connect("value-changed", self._on_silence_changed)
         self.voice_commands_switch.connect("state-set", self._on_voice_commands_toggled)
@@ -1488,6 +1510,7 @@ class SettingsDialog(Gtk.Dialog):
         self.current_engine = settings["engine"]
         self.language = settings["language"]
         self.current_model_size = settings["model_size"]
+        self.current_output_mode = settings.get("output_mode", "deferred_until_release")
         self.current_vad = settings.get("vad_sensitivity", 3)
         self.current_silence = settings.get("silence_timeout", 2.0)
 
@@ -1565,6 +1588,8 @@ class SettingsDialog(Gtk.Dialog):
                 self.language = "auto"
 
         # Set spin button values
+        if not self.output_mode_combo.set_active_id(self.current_output_mode):
+            self.output_mode_combo.set_active_id("deferred_until_release")
         self.vad_spin.set_value(self.current_vad)
         self.silence_spin.set_value(self.current_silence)
 
@@ -1583,10 +1608,11 @@ class SettingsDialog(Gtk.Dialog):
         model_size = self.config_manager.get_model_size_for_engine(engine)
         vad_sensitivity = sr_settings.get("vad_sensitivity", 3)
         silence_timeout = sr_settings.get("silence_timeout", 2.0)
+        output_mode = sr_settings.get("output_mode", "deferred_until_release")
 
         logger.info(
             f"Loaded current settings: engine={engine}, language={language}, model_size={model_size}, "
-            f"vad={vad_sensitivity}, silence={silence_timeout}"
+            f"vad={vad_sensitivity}, silence={silence_timeout}, output_mode={output_mode}"
         )
 
         return {
@@ -1595,6 +1621,7 @@ class SettingsDialog(Gtk.Dialog):
             "model_size": model_size,
             "vad_sensitivity": vad_sensitivity,
             "silence_timeout": silence_timeout,
+            "output_mode": output_mode,
         }
 
     def _populate_model_options(self):
@@ -1726,6 +1753,10 @@ class SettingsDialog(Gtk.Dialog):
 
     def _on_silence_changed(self, widget):
         """Handle changes in silence timeout."""
+        self._auto_apply_settings()
+
+    def _on_output_mode_changed(self, widget):
+        """Handle output mode selection changes."""
         self._auto_apply_settings()
 
     def _on_voice_commands_toggled(self, widget, state):
@@ -1995,6 +2026,7 @@ class SettingsDialog(Gtk.Dialog):
 
         vad = int(self.vad_spin.get_value())
         silence = self.silence_spin.get_value()
+        output_mode = self.output_mode_combo.get_active_id() or "deferred_until_release"
 
         return {
             "engine": engine,
@@ -2002,6 +2034,7 @@ class SettingsDialog(Gtk.Dialog):
             "language": language,
             "vad_sensitivity": vad,
             "silence_timeout": silence,
+            "output_mode": output_mode,
         }
 
     def _on_test_clicked(self, widget):

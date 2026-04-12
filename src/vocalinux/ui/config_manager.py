@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping
         "voice_commands_enabled": None,  # None = auto (enabled for VOSK, disabled for Whisper)
+        "output_mode": "deferred_until_release",  # "immediate" or "deferred_until_release"
     },
     "audio": {
         "device_index": None,  # Audio input device index (None for system default)

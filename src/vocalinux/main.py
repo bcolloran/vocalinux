@@ -348,9 +348,23 @@ def main():
     vad_sensitivity = saved_settings.get("vad_sensitivity", 3)
     silence_timeout = saved_settings.get("silence_timeout", 2.0)
     voice_commands_enabled = saved_settings.get("voice_commands_enabled")  # None = auto
+    output_mode = saved_settings.get("output_mode", "deferred_until_release")
     audio_device_index = audio_settings.get("device_index", None)
 
-    logger.info(f"Final settings: engine={engine}, language={language}, model={model_size}")
+    if output_mode not in {"immediate", "deferred_until_release"}:
+        logger.warning(
+            "Unknown output mode '%s' in config. Falling back to deferred_until_release.",
+            output_mode,
+        )
+        output_mode = "deferred_until_release"
+
+    logger.info(
+        "Final settings: engine=%s, language=%s, model=%s, output_mode=%s",
+        engine,
+        language,
+        model_size,
+        output_mode,
+    )
     if audio_device_index is not None:
         logger.info(f"Using audio device index={audio_device_index} (from saved config)")
 
@@ -395,6 +409,26 @@ def main():
         #       new listening session starts.
         # ------------------------------------------------------------------
 
+        deferred_session_segments: list[str] = []
+        has_active_recording_session = False
+
+        def reset_session_buffers() -> None:
+            """Reset per-session buffered output."""
+            deferred_session_segments.clear()
+            action_handler.set_last_injected_text("")
+
+        def commit_deferred_session_text() -> None:
+            """Inject buffered finalized segments once for deferred output mode."""
+            if output_mode != "deferred_until_release":
+                return
+            if not deferred_session_segments:
+                return
+
+            text_to_inject = " ".join(deferred_session_segments)
+            success = text_system.inject_text(text_to_inject)
+            if success:
+                action_handler.set_last_injected_text(text_to_inject)
+
         def text_callback_wrapper(text: str) -> None:
             """Bridge between speech engine text events and the text injector.
 
@@ -410,6 +444,10 @@ def main():
             if not text_to_inject:
                 return
 
+            if output_mode == "deferred_until_release":
+                deferred_session_segments.append(text_to_inject)
+                return
+
             # Add a separating space between consecutive dictation segments,
             # but never for the very first segment (avoids unwanted leading space
             # when starting dictation in an empty text field).
@@ -423,8 +461,17 @@ def main():
 
         def on_state_change(state: RecognitionState) -> None:
             """Reset the last-injected buffer when a new listening session starts."""
+            nonlocal has_active_recording_session
             if state == RecognitionState.LISTENING:
-                action_handler.set_last_injected_text("")
+                has_active_recording_session = True
+                reset_session_buffers()
+            elif state == RecognitionState.ERROR:
+                has_active_recording_session = False
+                reset_session_buffers()
+            elif state == RecognitionState.IDLE and has_active_recording_session:
+                commit_deferred_session_text()
+                has_active_recording_session = False
+                reset_session_buffers()
 
         # Connect speech recognition to text injection and action handling
         speech_engine.register_text_callback(text_callback_wrapper)
