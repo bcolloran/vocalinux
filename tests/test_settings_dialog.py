@@ -160,6 +160,78 @@ class TestSettingsDialog(unittest.TestCase):
         mock_speech_engine.reconfigure.assert_called_once()
 
 
+class TestSettingsDialogDownloadApply(unittest.TestCase):
+    """Regression tests for model download/apply result handling."""
+
+    def setUp(self):
+        if "vocalinux.ui.settings_dialog" in sys.modules:
+            del sys.modules["vocalinux.ui.settings_dialog"]
+
+    def test_run_download_and_apply_returns_false_when_apply_fails(self):
+        """Failed background apply should not mark the download as successful."""
+        from vocalinux.ui.settings_dialog import _run_download_and_apply
+
+        speech_engine = Mock()
+        speech_engine.set_download_progress_callback = Mock()
+        speech_engine.cancel_download = Mock()
+        apply_settings_callback = Mock(side_effect=RuntimeError("network broke"))
+        mock_download_dialog = Mock(cancelled=False)
+        mock_download_dialog.set_complete = Mock()
+
+        with patch("vocalinux.ui.settings_dialog.GLib") as mock_glib:
+            mock_glib.idle_add.side_effect = lambda func, *args: func(*args)
+            mock_glib.timeout_add.return_value = 1
+            mock_glib.source_remove.return_value = None
+            result = _run_download_and_apply(
+                speech_engine=speech_engine,
+                settings={"engine": "whisper_cpp", "model_size": "small"},
+                engine="whisper_cpp",
+                model_name="small",
+                download_dialog=mock_download_dialog,
+                progress_callback=Mock(),
+                apply_settings_callback=apply_settings_callback,
+            )
+
+        self.assertFalse(result)
+        apply_settings_callback.assert_called_once_with(
+            {"engine": "whisper_cpp", "model_size": "small"},
+            raise_on_error=True,
+            show_error_dialog=False,
+        )
+        mock_download_dialog.set_complete.assert_called_once_with(False, "network broke")
+
+    def test_run_download_and_apply_returns_true_when_apply_succeeds(self):
+        """Successful background apply should mark the download successful once."""
+        from vocalinux.ui.settings_dialog import _run_download_and_apply
+
+        speech_engine = Mock()
+        speech_engine.set_download_progress_callback = Mock()
+        speech_engine.cancel_download = Mock()
+        apply_settings_callback = Mock(return_value=True)
+        success_callback = Mock()
+        mock_download_dialog = Mock(cancelled=False)
+        mock_download_dialog.set_complete = Mock()
+
+        with patch("vocalinux.ui.settings_dialog.GLib") as mock_glib:
+            mock_glib.idle_add.side_effect = lambda func, *args: func(*args)
+            mock_glib.timeout_add.return_value = 1
+            mock_glib.source_remove.return_value = None
+            result = _run_download_and_apply(
+                speech_engine=speech_engine,
+                settings={"engine": "whisper_cpp", "model_size": "small"},
+                engine="whisper_cpp",
+                model_name="small",
+                download_dialog=mock_download_dialog,
+                progress_callback=Mock(),
+                apply_settings_callback=apply_settings_callback,
+                success_callback=success_callback,
+            )
+
+        self.assertTrue(result)
+        mock_download_dialog.set_complete.assert_called_once_with(True, "")
+        success_callback.assert_called_once()
+
+
 class TestSettingsDialogCSS(unittest.TestCase):
     """Test cases for SettingsDialog CSS styling."""
 

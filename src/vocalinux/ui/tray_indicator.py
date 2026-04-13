@@ -87,10 +87,12 @@ class TrayIndicator:
         self.preview_window = preview_window
         self.config_manager = ConfigManager()  # Added: Initialize ConfigManager
         self._syncing_autostart_menu = False
+        self._push_to_talk_preview_active = False
+        self._ignore_next_release = False
 
         # Get configured shortcut and mode from config
         shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", "ctrl+ctrl")
-        mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        mode = self.config_manager.get_str("shortcuts", "mode", "push_to_talk")
         min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
 
         # Initialize keyboard shortcut manager with configured shortcut and mode
@@ -148,9 +150,10 @@ class TrayIndicator:
         self.shortcut_manager.register_toggle_callback(None)
         self.shortcut_manager.register_press_callback(None)
         self.shortcut_manager.register_release_callback(None)
+        self.shortcut_manager.register_escape_callback(self._on_escape_pressed)
 
         # Get configured mode from config
-        mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        mode = self.config_manager.get_str("shortcuts", "mode", "push_to_talk")
         min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
         self.shortcut_manager.set_min_hold_ms(min_hold_ms)
         logger.info(f"Setting up keyboard shortcuts with mode: {mode}")
@@ -346,10 +349,45 @@ class TrayIndicator:
     def _start_recognition(self):
         """Start voice recognition (for push-to-talk mode)."""
         if self.speech_engine.state == RecognitionState.IDLE:
+            preview_session_enabled = (
+                self.output_controller is not None and self.preview_window is not None
+            )
+            if preview_session_enabled:
+                logger.info(
+                    "Starting HTT preview session. output_mode=%s preview_window=%s",
+                    self.output_controller.output_mode,
+                    type(self.preview_window).__name__,
+                )
+                self._push_to_talk_preview_active = True
+                self._ignore_next_release = False
+                self.output_controller.begin_push_to_talk_preview_session()
+                GLib.idle_add(self.preview_window.set_session_active, True)
+                GLib.idle_add(self._present_preview_window, False)
             self.speech_engine.start_recognition(mode="push_to_talk")
+            if preview_session_enabled and self.speech_engine.state == RecognitionState.IDLE:
+                logger.info("HTT preview session did not start because recognition stayed idle.")
+                self._push_to_talk_preview_active = False
+                self.output_controller.end_live_preview_session()
+                GLib.idle_add(self.preview_window.set_session_active, False)
+                GLib.idle_add(self._hide_preview_window)
 
     def _stop_recognition(self):
         """Stop voice recognition (for push-to-talk mode)."""
+        if self._ignore_next_release:
+            logger.info("Ignoring HTT release because the session was already cancelled.")
+            self._ignore_next_release = False
+            return
+
+        if self._push_to_talk_preview_active and self.output_controller is not None:
+            logger.info(
+                "HTT release detected; committing live preview text before stopping recognition."
+            )
+            self.output_controller.commit_live_preview_text()
+            self._push_to_talk_preview_active = False
+            if self.preview_window is not None:
+                GLib.idle_add(self.preview_window.set_session_active, False)
+                GLib.idle_add(self._hide_preview_window)
+
         if self.speech_engine.state != RecognitionState.IDLE:
             self.speech_engine.stop_recognition()
 
@@ -433,6 +471,8 @@ class TrayIndicator:
 
     def _on_preview_text_changed(self, preview_text: str):
         """Handle incremental preview text updates from the recognition thread."""
+        if self.output_controller is not None:
+            self.output_controller.update_live_preview_text(preview_text)
         GLib.idle_add(self._update_preview_text, preview_text)
         if self.preview_window is not None:
             GLib.idle_add(self.preview_window.update_live_preview, preview_text)
@@ -493,14 +533,39 @@ class TrayIndicator:
         )
         return False
 
-    def _present_preview_window(self):
+    def _present_preview_window(self, steal_focus: bool = True):
         """Show the preview window if available."""
         if self.preview_window is None:
             logger.info("Preview window requested but no preview window is configured.")
-            return
+            return False
 
         logger.info("Opening preview window from tray.")
-        self.preview_window.present_for_review()
+        self.preview_window.present_for_review(steal_focus=steal_focus)
+        return False
+
+    def _hide_preview_window(self):
+        """Hide the preview window if it exists."""
+        if self.preview_window is not None:
+            self.preview_window.hide()
+        return False
+
+    def _on_escape_pressed(self):
+        """Cancel an active HTT preview session when Escape is pressed globally."""
+        if (
+            not self._push_to_talk_preview_active
+            or self.output_controller is None
+            or self.speech_engine.state == RecognitionState.IDLE
+        ):
+            return
+
+        logger.info("Escape pressed during active HTT preview session; cancelling session.")
+        self._ignore_next_release = True
+        self._push_to_talk_preview_active = False
+        self.output_controller.cancel_live_preview_session()
+        if self.preview_window is not None:
+            GLib.idle_add(self.preview_window.set_session_active, False)
+            GLib.idle_add(self._hide_preview_window)
+        self.speech_engine.stop_recognition()
 
     def _update_ui(self, state: RecognitionState):
         """
@@ -513,6 +578,7 @@ class TrayIndicator:
             return False
 
         if state == RecognitionState.IDLE:
+            self._push_to_talk_preview_active = False
             self.indicator.set_icon_full(self.icon_names["default"], "Microphone off")
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)

@@ -135,6 +135,9 @@ class TranscriptOutputController:
         self.pending_store = pending_store or PendingTranscriptStore()
         self.output_mode = normalize_output_mode(output_mode)
         self._mode_listeners: list[Callable[[str], None]] = []
+        self._live_preview_text = ""
+        self._skip_next_finalized_text = False
+        self._push_to_talk_session_active = False
 
     def is_preview_mode(self) -> bool:
         """Return whether the controller is in preview-first mode."""
@@ -180,11 +183,79 @@ class TranscriptOutputController:
         """Return whether pending transcript is available."""
         return self.pending_store.has_text()
 
+    def update_live_preview_text(self, preview_text: str) -> None:
+        """Track the latest incremental preview text for HTT release commit."""
+        self._live_preview_text = preview_text.strip()
+
+    def get_live_preview_text(self) -> str:
+        """Return the latest incremental preview text."""
+        return self._live_preview_text
+
+    def begin_push_to_talk_preview_session(self) -> None:
+        """Start a push-to-talk preview session."""
+        self._push_to_talk_session_active = True
+        self._live_preview_text = ""
+        logger.info("Started push-to-talk preview session.")
+
+    def is_push_to_talk_preview_session_active(self) -> bool:
+        """Return whether a push-to-talk preview session is active."""
+        return self._push_to_talk_session_active
+
+    def commit_live_preview_text(self) -> bool:
+        """Inject the current live preview text and suppress the later finalized callback."""
+        live_preview_text = self._live_preview_text.strip()
+        self._skip_next_finalized_text = True
+        self._push_to_talk_session_active = False
+
+        if not live_preview_text:
+            logger.info(
+                "HTT release commit requested with no live preview text; finalized callback will "
+                "be suppressed."
+            )
+            self._live_preview_text = ""
+            return False
+
+        logger.info("Committing HTT live preview text (%s character(s)).", len(live_preview_text))
+        success = self.text_injector.inject_text(live_preview_text)
+        logger.info("HTT live preview commit %s.", "succeeded" if success else "failed")
+        if success:
+            self.action_handler.set_last_injected_text(live_preview_text)
+        self._live_preview_text = ""
+        return success
+
+    def cancel_live_preview_session(self) -> None:
+        """Cancel the current HTT preview session and suppress the later finalized callback."""
+        self._skip_next_finalized_text = True
+        self._push_to_talk_session_active = False
+        self._live_preview_text = ""
+        logger.info("Cancelled HTT live preview session; finalized callback will be suppressed.")
+
+    def end_live_preview_session(self) -> None:
+        """End the current HTT preview session without suppressing finalized callbacks."""
+        self._push_to_talk_session_active = False
+        self._live_preview_text = ""
+        logger.info("Ended HTT live preview session without commit or cancellation.")
+
     def handle_finalized_text(self, text: str) -> None:
         """Handle a finalized recognition segment."""
         text_to_handle = text.strip()
         if not text_to_handle:
             logger.debug("Ignoring empty finalized text segment.")
+            return
+
+        if self._push_to_talk_session_active:
+            logger.info(
+                "Ignoring finalized text while HTT preview session is active; live preview "
+                "remains the commit source."
+            )
+            return
+
+        if self._skip_next_finalized_text:
+            self._skip_next_finalized_text = False
+            logger.info(
+                "Skipping finalized text callback because transcript was already committed or "
+                "cancelled from live preview."
+            )
             return
 
         if self.is_preview_mode():
@@ -220,6 +291,7 @@ class TranscriptOutputController:
             return
 
         if state == RecognitionState.IDLE:
+            self._push_to_talk_session_active = False
             if self.is_preview_mode() and self.pending_store.has_text():
                 logger.info(
                     "Recognition stopped with pending transcript ready for review (%s character(s)).",

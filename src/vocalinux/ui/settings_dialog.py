@@ -28,7 +28,12 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from ..common_types import RecognitionState  # noqa: E402
-from ..transcript_output import OUTPUT_MODE_IMMEDIATE, OUTPUT_MODE_PREVIEW, normalize_output_mode
+from ..transcript_output import (
+    OUTPUT_MODE_DEFAULT,
+    OUTPUT_MODE_IMMEDIATE,
+    OUTPUT_MODE_PREVIEW,
+    normalize_output_mode,
+)
 from ..utils.vosk_model_info import SUPPORTED_LANGUAGES, VOSK_MODEL_INFO  # noqa: E402
 from ..utils.whispercpp_model_info import (
     WHISPERCPP_MODEL_INFO,
@@ -88,6 +93,69 @@ OUTPUT_MODES = {
     OUTPUT_MODE_IMMEDIATE: "Immediate (inject each finalized segment)",
     OUTPUT_MODE_PREVIEW: "Preview before commit (review, then commit or discard)",
 }
+
+
+def _run_download_and_apply(
+    *,
+    speech_engine,
+    settings: dict,
+    engine: str,
+    model_name: str,
+    download_dialog,
+    progress_callback: Callable[[float, float, str], None],
+    apply_settings_callback: Callable[..., bool],
+    success_callback: Optional[Callable[[], None]] = None,
+    whisper_install_callback: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Run a download/apply cycle and update the progress dialog once."""
+    try:
+        speech_engine.set_download_progress_callback(progress_callback)
+
+        def check_cancelled():
+            if download_dialog.cancelled:
+                speech_engine.cancel_download()
+            return not download_dialog.cancelled
+
+        cancel_check_id = GLib.timeout_add(100, check_cancelled)
+
+        try:
+            logger.info("Starting model download/apply. engine=%s model=%s", engine, model_name)
+            apply_settings_callback(
+                settings,
+                raise_on_error=True,
+                show_error_dialog=False,
+            )
+            logger.info(
+                "Model download/apply completed successfully. engine=%s model=%s",
+                engine,
+                model_name,
+            )
+            GLib.idle_add(download_dialog.set_complete, True, "")
+            if success_callback is not None:
+                GLib.idle_add(success_callback)
+            return True
+        finally:
+            GLib.source_remove(cancel_check_id)
+            speech_engine.set_download_progress_callback(None)
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(
+            "Model download/apply failed. engine=%s model=%s error=%s",
+            engine,
+            model_name,
+            error_msg,
+            exc_info=True,
+        )
+        if "cancelled" in error_msg.lower():
+            GLib.idle_add(download_dialog.set_complete, False, "Download cancelled")
+        elif engine == "whisper" and "no module named" in error_msg.lower():
+            GLib.idle_add(download_dialog.set_complete, False, "Whisper not installed")
+            if whisper_install_callback is not None:
+                GLib.idle_add(whisper_install_callback)
+        else:
+            GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+        return False
 
 
 def get_available_engines():
@@ -1245,9 +1313,9 @@ class SettingsDialog(Gtk.Dialog):
             self.shortcut_mode_combo.append(mode_id, display_name)
 
         # Load current mode from config
-        current_mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        current_mode = self.config_manager.get_str("shortcuts", "mode", "push_to_talk")
         if not self.shortcut_mode_combo.set_active_id(current_mode):
-            self.shortcut_mode_combo.set_active_id("toggle")
+            self.shortcut_mode_combo.set_active_id("push_to_talk")
 
         mode_row = PreferenceRow(
             title="Shortcut Mode",
@@ -1622,7 +1690,7 @@ class SettingsDialog(Gtk.Dialog):
 
         # Set spin button values
         if not self.output_mode_combo.set_active_id(self.current_output_mode):
-            self.output_mode_combo.set_active_id(OUTPUT_MODE_IMMEDIATE)
+            self.output_mode_combo.set_active_id(OUTPUT_MODE_DEFAULT)
         self.vad_spin.set_value(self.current_vad)
         self.silence_spin.set_value(self.current_silence)
 
@@ -1997,41 +2065,17 @@ class SettingsDialog(Gtk.Dialog):
                     GLib.idle_add(download_dialog.update_progress, fraction, speed, status)
 
                 def download_and_apply():
-                    try:
-                        self.speech_engine.set_download_progress_callback(progress_callback)
-
-                        def check_cancelled():
-                            if download_dialog.cancelled:
-                                self.speech_engine.cancel_download()
-                            return not download_dialog.cancelled
-
-                        cancel_check_id = GLib.timeout_add(100, check_cancelled)
-
-                        try:
-                            self._apply_settings_internal(settings)
-                            GLib.idle_add(download_dialog.set_complete, True, "")
-                            GLib.idle_add(self._populate_model_options)
-                        finally:
-                            GLib.source_remove(cancel_check_id)
-                            self.speech_engine.set_download_progress_callback(None)
-
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "cancelled" in error_msg.lower():
-                            GLib.idle_add(
-                                download_dialog.set_complete,
-                                False,
-                                "Download cancelled",
-                            )
-                        elif engine == "whisper" and "no module named" in error_msg.lower():
-                            GLib.idle_add(
-                                download_dialog.set_complete,
-                                False,
-                                "Whisper not installed",
-                            )
-                            GLib.idle_add(self._show_whisper_install_dialog)
-                        else:
-                            GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+                    _run_download_and_apply(
+                        speech_engine=self.speech_engine,
+                        settings=settings,
+                        engine=engine,
+                        model_name=model_name,
+                        download_dialog=download_dialog,
+                        progress_callback=progress_callback,
+                        apply_settings_callback=self._apply_settings_internal,
+                        success_callback=self._populate_model_options,
+                        whisper_install_callback=self._show_whisper_install_dialog,
+                    )
 
                 threading.Thread(target=download_and_apply, daemon=True).start()
                 download_dialog.run()
@@ -2228,6 +2272,9 @@ For now, the engine has been reverted to VOSK."""
         if engine == "whisper" and not _is_whisper_model_downloaded(model_name):
             needs_download = True
             model_info = WHISPER_MODEL_INFO.get(model_name, {"size_mb": 500})
+        elif engine == "whisper_cpp" and not is_whispercpp_model_downloaded(model_name):
+            needs_download = True
+            model_info = WHISPERCPP_MODEL_INFO.get(model_name, {"size_mb": 39})
         elif engine == "vosk" and not _is_vosk_model_downloaded(model_name, self.language):
             needs_download = True
             model_info = VOSK_MODEL_INFO.get(model_name, {"size_mb": 50})
@@ -2240,48 +2287,39 @@ For now, the engine has been reverted to VOSK."""
                 engine=engine,
                 language=self.language,
             )
+            download_result = {"success": False}
 
             def progress_callback(fraction, speed, status):
                 GLib.idle_add(download_dialog.update_progress, fraction, speed, status)
 
             def download_and_apply():
-                try:
-                    self.speech_engine.set_download_progress_callback(progress_callback)
-
-                    def check_cancelled():
-                        if download_dialog.cancelled:
-                            self.speech_engine.cancel_download()
-                        return not download_dialog.cancelled
-
-                    cancel_check_id = GLib.timeout_add(100, check_cancelled)
-
-                    try:
-                        self._apply_settings_internal(settings)
-                        GLib.idle_add(download_dialog.set_complete, True, "")
-                    finally:
-                        GLib.source_remove(cancel_check_id)
-                        self.speech_engine.set_download_progress_callback(None)
-
-                except Exception as e:
-                    error_msg = str(e)
-                    if "cancelled" in error_msg.lower():
-                        GLib.idle_add(download_dialog.set_complete, False, "Download cancelled")
-                    elif engine == "whisper" and "no module named" in error_msg.lower():
-                        GLib.idle_add(download_dialog.set_complete, False, "Whisper not installed")
-                        GLib.idle_add(self._show_whisper_install_dialog)
-                    else:
-                        GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+                download_result["success"] = _run_download_and_apply(
+                    speech_engine=self.speech_engine,
+                    settings=settings,
+                    engine=engine,
+                    model_name=model_name,
+                    download_dialog=download_dialog,
+                    progress_callback=progress_callback,
+                    apply_settings_callback=self._apply_settings_internal,
+                    whisper_install_callback=self._show_whisper_install_dialog,
+                )
 
             threading.Thread(target=download_and_apply, daemon=True).start()
             download_dialog.run()
             download_dialog.destroy()
 
             self._populate_model_options()
-            return True
+            return download_result["success"]
 
         return self._apply_settings_internal(settings)
 
-    def _apply_settings_internal(self, settings: dict) -> bool:
+    def _apply_settings_internal(
+        self,
+        settings: dict,
+        *,
+        raise_on_error: bool = False,
+        show_error_dialog: bool = True,
+    ) -> bool:
         """Internal method to apply settings."""
         try:
             self.config_manager.update_speech_recognition_settings(settings)
@@ -2298,6 +2336,12 @@ For now, the engine has been reverted to VOSK."""
             return True
         except Exception as e:
             logger.error(f"Failed to apply settings: {e}", exc_info=True)
+
+            if raise_on_error:
+                raise
+
+            if not show_error_dialog:
+                return False
 
             if "whisper" in str(e).lower() and "no module named" in str(e).lower():
                 self._show_whisper_install_dialog()

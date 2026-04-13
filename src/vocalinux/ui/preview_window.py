@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 import gi
 
@@ -18,17 +19,27 @@ logger = logging.getLogger(__name__)
 class PreviewWindow(Gtk.Window):
     """Simple review window for pending transcript commit/discard actions."""
 
-    def __init__(self, controller: TranscriptOutputController) -> None:
+    def __init__(
+        self,
+        controller: TranscriptOutputController,
+        cancel_callback: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(title="Pending Transcript Review")
         self.controller = controller
+        self.cancel_callback = cancel_callback
         self.output_mode = controller.output_mode
         self.pending_text = controller.get_pending_text()
         self.live_preview_text = ""
+        self.session_active = False
 
         self.set_default_size(520, 360)
         self.set_border_width(16)
-        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_keep_above(True)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
         self.connect("delete-event", self._on_delete_event)
+        self.connect("key-press-event", self._on_key_press_event)
 
         outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.add(outer_box)
@@ -94,20 +105,33 @@ class PreviewWindow(Gtk.Window):
         self._refresh_ui()
         return False
 
-    def present_for_review(self) -> None:
+    def set_session_active(self, session_active: bool) -> bool:
+        """Update the HTT session state shown in the window."""
+        self.session_active = session_active
+        self._refresh_ui()
+        return False
+
+    def present_for_review(self, steal_focus: bool = False) -> None:
         """Show and focus the review window."""
         logger.info(
-            "Presenting preview window. Pending transcript available=%s.",
+            "Presenting preview window. Pending transcript available=%s, steal_focus=%s.",
             bool(self.pending_text),
+            steal_focus,
         )
+        self.move(0, 0)
+        self.set_accept_focus(steal_focus)
+        self.set_focus_on_map(steal_focus)
         self.show_all()
-        self.present()
+        if steal_focus:
+            self.present()
 
     def _refresh_ui(self) -> None:
         pending_available = bool(self.pending_text)
         preview_available = bool(self.live_preview_text)
 
-        if pending_available:
+        if self.session_active:
+            status_text = "HTT active. Release to inject the live preview, or press Esc to cancel."
+        elif pending_available:
             status_text = (
                 "Pending transcript is ready. Review it, then Commit or Discard when you're ready."
             )
@@ -129,12 +153,15 @@ class PreviewWindow(Gtk.Window):
         else:
             self.live_preview_label.hide()
 
-        transcript_text = self.pending_text or "No pending transcript."
+        transcript_text = self.pending_text or (
+            "" if self.session_active else "No pending transcript."
+        )
         self.transcript_view.get_buffer().set_text(transcript_text)
 
-        self.commit_button.set_sensitive(pending_available)
-        self.discard_button.set_sensitive(pending_available)
-        self.copy_button.set_sensitive(pending_available)
+        self.commit_button.set_sensitive(pending_available and not self.session_active)
+        self.discard_button.set_sensitive(pending_available and not self.session_active)
+        self.copy_button.set_sensitive(pending_available and not self.session_active)
+        self.close_button.set_sensitive(not self.session_active)
 
     def _on_commit_clicked(self, widget) -> None:
         logger.info("Commit clicked in preview window.")
@@ -164,3 +191,10 @@ class PreviewWindow(Gtk.Window):
         logger.info("Preview window closed via window manager; pending transcript preserved.")
         self.hide()
         return True
+
+    def _on_key_press_event(self, widget, event) -> bool:
+        if event.keyval == Gdk.KEY_Escape and self.session_active and self.cancel_callback is not None:
+            logger.info("Escape pressed in preview window during active HTT session.")
+            self.cancel_callback()
+            return True
+        return False

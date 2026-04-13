@@ -425,6 +425,7 @@ def main():
             output_controller=output_controller,
             preview_window=preview_window,
         )
+        preview_window.cancel_callback = indicator._on_escape_pressed
 
         # Start the GTK main loop
         indicator.run()

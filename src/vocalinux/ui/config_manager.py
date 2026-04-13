@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
     },
     "shortcuts": {
         "toggle_recognition": "ctrl+ctrl",  # Double-tap modifier key
-        "mode": "toggle",  # "toggle" or "push_to_talk"
+        "mode": "push_to_talk",  # "toggle" or "push_to_talk"
         "min_hold_ms": 500,  # Minimum hold duration required to finalize in hold mode
         # Supported values: "ctrl+ctrl", "alt+alt", "shift+shift"
         # These represent double-tap shortcuts for the respective modifier keys

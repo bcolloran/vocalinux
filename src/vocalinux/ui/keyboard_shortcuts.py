@@ -369,6 +369,17 @@ class KeyboardShortcutManager:
             return
 
         self.backend_instance.register_release_callback(callback)
+
+    def register_escape_callback(self, callback: Optional[Callable[[], None]]):
+        """
+        Register a callback for global Escape key presses.
+
+        Args:
+            callback: Function to call when Escape is pressed
+        """
+        if not self.backend_instance:
+            return
+        self.backend_instance.register_escape_callback(callback)
         if callback is None:
             logger.debug("Cleared release callback")
         else:

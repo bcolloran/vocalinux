@@ -81,6 +81,37 @@ class TestTranscriptOutputController(unittest.TestCase):
             ["hello", " world"],
         )
 
+    def test_live_preview_commit_suppresses_next_finalized_callback(self):
+        controller, text_injector = self._make_controller(OUTPUT_MODE_PREVIEW)
+
+        controller.begin_push_to_talk_preview_session()
+        controller.update_live_preview_text("live preview text")
+        self.assertTrue(controller.commit_live_preview_text())
+        controller.handle_finalized_text("finalized text")
+
+        text_injector.inject_text.assert_called_once_with("live preview text")
+        self.assertFalse(controller.has_pending_text())
+
+    def test_live_preview_cancel_suppresses_next_finalized_callback(self):
+        controller, text_injector = self._make_controller(OUTPUT_MODE_PREVIEW)
+
+        controller.begin_push_to_talk_preview_session()
+        controller.update_live_preview_text("live preview text")
+        controller.cancel_live_preview_session()
+        controller.handle_finalized_text("finalized text")
+
+        text_injector.inject_text.assert_not_called()
+        self.assertFalse(controller.has_pending_text())
+
+    def test_active_htt_preview_ignores_finalized_text_even_in_immediate_mode(self):
+        controller, text_injector = self._make_controller(OUTPUT_MODE_IMMEDIATE)
+
+        controller.begin_push_to_talk_preview_session()
+        controller.handle_finalized_text("finalized text")
+
+        text_injector.inject_text.assert_not_called()
+        self.assertFalse(controller.has_pending_text())
+
 
 if __name__ == "__main__":
     unittest.main()
