@@ -568,3 +568,57 @@ class TestEvdevKeyboardBackendGetTargetKeyCodes:
 
         assert 42 in result  # KEY_LEFTSHIFT
         assert 54 in result  # KEY_RIGHTSHIFT
+
+
+class TestEvdevKeyboardBackendFsmBehavior:
+    """Test double-tap-and-hold FSM behavior."""
+
+    def test_double_tap_and_hold_finalizes_when_threshold_met(self):
+        backend = EvdevKeyboardBackend(shortcut="ctrl+ctrl", mode="push_to_talk", min_hold_ms=500)
+        press_callback = MagicMock()
+        release_callback = MagicMock()
+        backend.register_press_callback(press_callback)
+        backend.register_release_callback(release_callback)
+
+        mock_device = MagicMock()
+        press_event = MagicMock()
+        press_event.code = 29  # KEY_LEFTCTRL
+        press_event.value = 1
+        release_event = MagicMock()
+        release_event.code = 29
+        release_event.value = 0
+
+        with patch("vocalinux.ui.keyboard_backends.evdev_backend.time.time") as mock_time:
+            mock_time.side_effect = [1.0, 1.2, 1.9]
+            backend._handle_key_event(press_event, mock_device)
+            backend._handle_key_event(press_event, mock_device)
+            backend._handle_key_event(release_event, mock_device)
+
+        time.sleep(0.1)
+        assert press_callback.called
+        assert release_callback.called
+
+    def test_double_tap_short_hold_does_not_finalize(self):
+        backend = EvdevKeyboardBackend(shortcut="ctrl+ctrl", mode="push_to_talk", min_hold_ms=500)
+        press_callback = MagicMock()
+        release_callback = MagicMock()
+        backend.register_press_callback(press_callback)
+        backend.register_release_callback(release_callback)
+
+        mock_device = MagicMock()
+        press_event = MagicMock()
+        press_event.code = 29
+        press_event.value = 1
+        release_event = MagicMock()
+        release_event.code = 29
+        release_event.value = 0
+
+        with patch("vocalinux.ui.keyboard_backends.evdev_backend.time.time") as mock_time:
+            mock_time.side_effect = [2.0, 2.2, 2.4]
+            backend._handle_key_event(press_event, mock_device)
+            backend._handle_key_event(press_event, mock_device)
+            backend._handle_key_event(release_event, mock_device)
+
+        time.sleep(0.1)
+        assert press_callback.called
+        assert release_callback.call_count == 0

@@ -54,7 +54,7 @@ class TestKeyboardShortcuts(unittest.TestCase):
         # Verify the shortcut was passed to create_backend
         # Verify the shortcut was passed to create_backend
         self.mock_create_backend.assert_called_with(
-            preferred_backend=None, shortcut="alt+alt", mode="toggle"
+            preferred_backend=None, shortcut="alt+alt", mode="toggle", min_hold_ms=500
         )
 
     def test_default_shortcut(self):
@@ -110,6 +110,23 @@ class TestKeyboardShortcuts(unittest.TestCase):
         """Test the shortcut_display_name property."""
         display_name = self.ksm.shortcut_display_name
         self.assertEqual(display_name, SHORTCUT_DISPLAY_NAMES["ctrl+ctrl"])
+
+    def test_init_passes_default_min_hold_ms(self):
+        """Default min hold threshold is passed to backend creation."""
+        self.mock_create_backend.assert_called_with(
+            preferred_backend=None,
+            shortcut="ctrl+ctrl",
+            mode="toggle",
+            min_hold_ms=500,
+        )
+
+    def test_set_min_hold_ms(self):
+        """Setting hold threshold updates manager and backend."""
+        result = self.ksm.set_min_hold_ms(700)
+
+        self.assertTrue(result)
+        self.assertEqual(self.ksm.min_hold_ms, 700)
+        self.mock_backend.set_min_hold_ms.assert_called_once_with(700)
 
     def test_set_shortcut_valid(self):
         """Test setting a valid shortcut."""
@@ -626,7 +643,9 @@ class TestBackendFactory(unittest.TestCase):
                     result = create_backend(shortcut="alt+alt")
 
                     self.assertIsNotNone(result)
-                    MockPynput.assert_called_once_with(shortcut="alt+alt", mode="toggle")
+                    MockPynput.assert_called_once_with(
+                        shortcut="alt+alt", mode="toggle", min_hold_ms=500
+                    )
 
 
 class TestShortcutParseFunction(unittest.TestCase):

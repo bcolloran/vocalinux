@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, cast
 
 # Import the backend system
 from .keyboard_backends import (
+    DEFAULT_MIN_HOLD_MS,
     DEFAULT_SHORTCUT,
     DEFAULT_SHORTCUT_MODE,
     EVDEV_AVAILABLE,
@@ -63,6 +64,7 @@ class KeyboardShortcutManager:
         backend: Optional[str] = None,
         shortcut: str = DEFAULT_SHORTCUT,
         mode: str = DEFAULT_SHORTCUT_MODE,
+        min_hold_ms: int = DEFAULT_MIN_HOLD_MS,
     ):
         """
         Initialize the keyboard shortcut manager.
@@ -72,15 +74,20 @@ class KeyboardShortcutManager:
                     If not specified, auto-detects based on environment.
             shortcut: The shortcut to listen for (e.g., "ctrl+ctrl", "alt+alt")
             mode: The shortcut mode ("toggle" or "push_to_talk")
+            min_hold_ms: Minimum hold duration (ms) required to finalize recording
         """
         self.backend_instance = None
         self.active = False
         self._shortcut = shortcut
         self._mode = mode
+        self._min_hold_ms = max(0, int(min_hold_ms))
 
         # Create the appropriate backend
         self.backend_instance = create_backend(
-            preferred_backend=backend, shortcut=shortcut, mode=mode
+            preferred_backend=backend,
+            shortcut=shortcut,
+            mode=mode,
+            min_hold_ms=self._min_hold_ms,
         )
 
         if self.backend_instance is None:
@@ -121,6 +128,11 @@ class KeyboardShortcutManager:
         """Get the human-readable name for the current mode."""
         return SHORTCUT_MODES.get(self._mode, self._mode)
 
+    @property
+    def min_hold_ms(self) -> int:
+        """Get the minimum hold duration (ms) for finalize-on-release."""
+        return self._min_hold_ms
+
     def set_mode(self, mode: str) -> bool:
         """
         Update the shortcut mode.
@@ -143,6 +155,27 @@ class KeyboardShortcutManager:
             self.backend_instance.set_mode(mode)
             logger.info(f"Mode updated to: {SHORTCUT_MODES.get(mode, mode)}")
 
+        return True
+
+    def set_min_hold_ms(self, min_hold_ms: int) -> bool:
+        """
+        Update the minimum hold duration used for release finalization.
+
+        Args:
+            min_hold_ms: Minimum hold duration in milliseconds
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            parsed = max(0, int(min_hold_ms))
+        except (TypeError, ValueError):
+            logger.error(f"Invalid min_hold_ms value: {min_hold_ms}")
+            return False
+
+        self._min_hold_ms = parsed
+        if self.backend_instance:
+            self.backend_instance.set_min_hold_ms(parsed)
         return True
 
     @property
