@@ -56,8 +56,11 @@ def _is_sound_effects_enabled() -> bool:
     try:
         from .config_manager import ConfigManager
 
-        return ConfigManager().is_sound_effects_enabled()
-    except Exception:
+        enabled = ConfigManager().is_sound_effects_enabled()
+        logger.debug("Sound effects enabled=%s", enabled)
+        return enabled
+    except Exception as exc:
+        logger.warning("Failed to read sound-effects setting; defaulting to enabled: %s", exc)
         return True
 
 
@@ -76,18 +79,22 @@ def _get_audio_player():
 
     # Check for PulseAudio paplay (preferred)
     if shutil.which("paplay"):
+        logger.info("Selected audio player: paplay")
         return "paplay", ["wav"]
 
     # Check for ALSA aplay
     if shutil.which("aplay"):
+        logger.info("Selected audio player: aplay")
         return "aplay", ["wav"]
 
     # Check for play (from SoX)
     if shutil.which("play"):
+        logger.info("Selected audio player: play")
         return "play", ["wav"]
 
     # Check for mplayer
     if shutil.which("mplayer"):
+        logger.info("Selected audio player: mplayer")
         return "mplayer", ["wav"]
 
     # No suitable player found
@@ -110,6 +117,7 @@ def _play_sound_file(sound_path):
         return False
 
     player, formats = _get_audio_player()
+    logger.info("Attempting sound playback. sound=%s player=%s", sound_path, player)
 
     # Special handling for CI environment during tests
     # If we're in CI (no audio players available) but running tests,
@@ -119,6 +127,7 @@ def _play_sound_file(sound_path):
         player = "ci_test_player"
 
     if not player:
+        logger.warning("Skipping sound playback because no audio player is available.")
         return False
 
     # In CI mode, just pretend we played the sound and return success
@@ -159,6 +168,7 @@ def _play_sound_file(sound_path):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        logger.info("Spawned sound playback successfully for %s.", sound_path)
         return True
     except Exception as e:
         logger.error(f"Failed to play sound {sound_path}: {e}")
@@ -166,12 +176,39 @@ def _play_sound_file(sound_path):
 
 
 def play_start_sound():
-    return _play_sound_file(START_SOUND) if _is_sound_effects_enabled() else False
+    if not _is_sound_effects_enabled():
+        logger.info("Skipping start sound because sound effects are disabled.")
+        return False
+    return _play_sound_file(START_SOUND)
 
 
 def play_stop_sound():
-    return _play_sound_file(STOP_SOUND) if _is_sound_effects_enabled() else False
+    if not _is_sound_effects_enabled():
+        logger.info("Skipping stop sound because sound effects are disabled.")
+        return False
+    return _play_sound_file(STOP_SOUND)
 
 
 def play_error_sound():
-    return _play_sound_file(ERROR_SOUND) if _is_sound_effects_enabled() else False
+    if not _is_sound_effects_enabled():
+        logger.info("Skipping error sound because sound effects are disabled.")
+        return False
+    return _play_sound_file(ERROR_SOUND)
+
+
+def get_sound_diagnostics() -> dict[str, object]:
+    """Return current sound playback diagnostics for logging and support."""
+    player, formats = _get_audio_player()
+    diagnostics = {
+        "player": player,
+        "formats": formats,
+        "sound_effects_enabled": _is_sound_effects_enabled(),
+        "start_sound_exists": os.path.exists(START_SOUND),
+        "stop_sound_exists": os.path.exists(STOP_SOUND),
+        "error_sound_exists": os.path.exists(ERROR_SOUND),
+        "start_sound_path": START_SOUND,
+        "stop_sound_path": STOP_SOUND,
+        "error_sound_path": ERROR_SOUND,
+    }
+    logger.info("Sound diagnostics snapshot: %s", diagnostics)
+    return diagnostics

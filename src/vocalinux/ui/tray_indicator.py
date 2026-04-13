@@ -8,7 +8,7 @@ recognition process and displaying its status.
 import logging
 import os
 import signal
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import gi
 
@@ -34,6 +34,10 @@ from ..utils.resource_manager import ResourceManager
 from .config_manager import ConfigManager
 from .keyboard_shortcuts import KeyboardShortcutManager
 from .settings_dialog import SettingsDialog
+
+if TYPE_CHECKING:
+    from ..transcript_output import TranscriptOutputController
+    from .preview_window import PreviewWindow
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,8 @@ class TrayIndicator:
         self,
         speech_engine: SpeechRecognitionManagerProtocol,
         text_injector: TextInjectorProtocol,
+        output_controller: Optional["TranscriptOutputController"] = None,
+        preview_window: Optional["PreviewWindow"] = None,
     ):
         """
         Initialize the system tray indicator.
@@ -77,6 +83,8 @@ class TrayIndicator:
         """
         self.speech_engine = speech_engine
         self.text_injector = text_injector
+        self.output_controller = output_controller
+        self.preview_window = preview_window
         self.config_manager = ConfigManager()  # Added: Initialize ConfigManager
         self._syncing_autostart_menu = False
 
@@ -110,6 +118,9 @@ class TrayIndicator:
         # Register for speech recognition state changes
         self.speech_engine.register_state_callback(self._on_recognition_state_changed)
         self.speech_engine.register_preview_callback(self._on_preview_text_changed)
+        if self.output_controller is not None:
+            self.output_controller.register_pending_text_listener(self._on_pending_text_changed)
+            self.output_controller.register_mode_listener(self._on_output_mode_changed)
 
         # Initialize the icon files and validate resources
         self._init_icons()
@@ -225,7 +236,10 @@ class TrayIndicator:
         # Add menu items
         self._add_menu_item("Start Voice Typing", self._on_start_clicked)
         self._add_menu_item("Stop Voice Typing", self._on_stop_clicked)
-        self.preview_menu_item = self._add_menu_item("Preview: ", self._on_preview_clicked)
+        self.review_pending_menu_item = self._add_menu_item(
+            "Review Pending Transcript", self._on_review_pending_clicked
+        )
+        self.preview_menu_item = self._add_menu_item("Live Preview: ", self._on_preview_clicked)
         self.preview_menu_item.set_sensitive(False)
         self._add_menu_separator()
 
@@ -246,6 +260,8 @@ class TrayIndicator:
 
         # Show the menu
         self.menu.show_all()
+
+        self._refresh_review_menu_item()
 
         # Update the UI based on the initial state
         self._update_ui(RecognitionState.IDLE)
@@ -418,9 +434,28 @@ class TrayIndicator:
     def _on_preview_text_changed(self, preview_text: str):
         """Handle incremental preview text updates from the recognition thread."""
         GLib.idle_add(self._update_preview_text, preview_text)
+        if self.preview_window is not None:
+            GLib.idle_add(self.preview_window.update_live_preview, preview_text)
+
+    def _on_pending_text_changed(self, pending_text: str):
+        """Handle changes to the pending transcript."""
+        GLib.idle_add(self._refresh_review_menu_item)
+        if self.preview_window is not None:
+            GLib.idle_add(self.preview_window.update_pending_text, pending_text)
+
+    def _on_output_mode_changed(self, output_mode: str):
+        """Handle changes to the active transcript output mode."""
+        GLib.idle_add(self._refresh_review_menu_item)
+        if self.preview_window is not None:
+            GLib.idle_add(self.preview_window.set_output_mode, output_mode)
 
     def _on_preview_clicked(self, widget):
-        """No-op callback for the preview menu item."""
+        """Open the review window from the live preview row."""
+        self._present_preview_window()
+
+    def _on_review_pending_clicked(self, widget):
+        """Open the review window from the pending review row."""
+        self._present_preview_window()
 
     def _update_preview_text(self, preview_text: str):
         """Update preview text in tray menu on GTK main thread."""
@@ -432,6 +467,40 @@ class TrayIndicator:
             preview = preview[:77] + "..."
         self.preview_menu_item.set_label(f"Preview: {preview}")
         return False
+
+    def _refresh_review_menu_item(self):
+        """Update the review-transcript menu item based on current mode and pending text."""
+        if not hasattr(self, "review_pending_menu_item"):
+            return False
+
+        if self.output_controller is None:
+            self.review_pending_menu_item.set_sensitive(False)
+            self.review_pending_menu_item.set_label("Review Pending Transcript")
+            return False
+
+        has_pending_text = self.output_controller.has_pending_text()
+        if has_pending_text:
+            label = "Review Pending Transcript"
+        elif self.output_controller.is_preview_mode():
+            label = "Open Preview Window"
+        else:
+            label = "Preview Window Unavailable"
+
+        self.review_pending_menu_item.set_label(label)
+        self.review_pending_menu_item.set_sensitive(
+            self.preview_window is not None
+            and (self.output_controller.is_preview_mode() or has_pending_text)
+        )
+        return False
+
+    def _present_preview_window(self):
+        """Show the preview window if available."""
+        if self.preview_window is None:
+            logger.info("Preview window requested but no preview window is configured.")
+            return
+
+        logger.info("Opening preview window from tray.")
+        self.preview_window.present_for_review()
 
     def _update_ui(self, state: RecognitionState):
         """
@@ -448,6 +517,8 @@ class TrayIndicator:
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)
             self._update_preview_text("")
+            if self.output_controller is not None and self.output_controller.has_pending_text():
+                self._present_preview_window()
         elif state == RecognitionState.LISTENING:
             self.indicator.set_icon_full(self.icon_names["active"], "Microphone on")
             self._set_menu_item_enabled("Start Voice Typing", False)
@@ -501,6 +572,7 @@ class TrayIndicator:
             config_manager=self.config_manager,
             speech_engine=self.speech_engine,
             shortcut_update_callback=self.update_shortcut,
+            output_mode_changed_callback=self._on_output_mode_changed_from_settings,
         )
 
         # Connect to the response signal
@@ -526,6 +598,14 @@ class TrayIndicator:
         if response == Gtk.ResponseType.CLOSE or response == Gtk.ResponseType.DELETE_EVENT:
             logger.info("Settings dialog closed.")
             dialog.destroy()
+
+    def _on_output_mode_changed_from_settings(self, output_mode: str) -> None:
+        """Apply live output-mode changes from Settings."""
+        if self.output_controller is None:
+            return
+
+        logger.info("Applying output mode change from settings: %s", output_mode)
+        self.output_controller.set_output_mode(output_mode)
 
     def update_shortcut(
         self,

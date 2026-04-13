@@ -10,6 +10,8 @@ import logging
 import os
 from typing import Any, Optional
 
+from ..transcript_output import OUTPUT_MODE_DEFAULT, normalize_output_mode
+
 logger = logging.getLogger(__name__)
 
 # Define constants
@@ -28,7 +30,7 @@ DEFAULT_CONFIG = {
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping
         "voice_commands_enabled": None,  # None = auto (enabled for VOSK, disabled for Whisper)
-        "output_mode": "deferred_until_release",  # "immediate" or "deferred_until_release"
+        "output_mode": OUTPUT_MODE_DEFAULT,
     },
     "audio": {
         "device_index": None,  # Audio input device index (None for system default)
@@ -110,6 +112,7 @@ class ConfigManager:
                 self._migrate_config(user_config)
 
             self._migrate_shortcuts_config()
+            self._migrate_output_mode_config()
 
         except (json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load config: {e}")
@@ -171,6 +174,20 @@ class ConfigManager:
                 changed = True
 
         if changed:
+            self.save_config()
+
+    def _migrate_output_mode_config(self):
+        """Normalize saved output modes to the current values."""
+        sr_config = self.config.get("speech_recognition", {})
+        output_mode = sr_config.get("output_mode", OUTPUT_MODE_DEFAULT)
+        normalized_mode = normalize_output_mode(output_mode)
+        if normalized_mode != output_mode:
+            sr_config["output_mode"] = normalized_mode
+            logger.info(
+                "Normalized config output mode from '%s' to '%s'.",
+                output_mode,
+                normalized_mode,
+            )
             self.save_config()
 
     def save_config(self):

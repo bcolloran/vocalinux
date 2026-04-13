@@ -590,7 +590,6 @@ class TestPushToTalkMode(unittest.TestCase):
         manager.stop_recognition()
         self.assertEqual(manager._recognition_mode, "toggle")
 
-<<<<<<< HEAD
     def test_push_to_talk_stop_aggregates_deferred_session_into_single_segment(self):
         """Push-to-talk stop should enqueue one aggregated final segment."""
         manager = SpeechRecognitionManager(engine="vosk")
@@ -627,7 +626,7 @@ class TestPushToTalkMode(unittest.TestCase):
             manager._perform_recognition()
 
         self.assertEqual(callback.call_args_list, [call("one"), call("two")])
-=======
+
     def test_push_to_talk_calls_finalize_once_per_release(self):
         manager = SpeechRecognitionManager(engine="vosk")
         manager.register_text_callback(MagicMock())
@@ -652,7 +651,6 @@ class TestPushToTalkMode(unittest.TestCase):
         manager.stop_recognition()
 
         callback.assert_called_once_with("hello world from test")
->>>>>>> main
 
 
 class TestWhisperInitialization(unittest.TestCase):

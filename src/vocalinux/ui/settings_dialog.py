@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 import gi
 
@@ -28,6 +28,7 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from ..common_types import RecognitionState  # noqa: E402
+from ..transcript_output import OUTPUT_MODE_IMMEDIATE, OUTPUT_MODE_PREVIEW, normalize_output_mode
 from ..utils.vosk_model_info import SUPPORTED_LANGUAGES, VOSK_MODEL_INFO  # noqa: E402
 from ..utils.whispercpp_model_info import (
     WHISPERCPP_MODEL_INFO,
@@ -42,6 +43,7 @@ from .keyboard_backends import (  # noqa: E402
     SHORTCUT_MODES,
     SUPPORTED_SHORTCUTS,
 )
+from .audio_feedback import get_sound_diagnostics, play_start_sound, play_stop_sound
 
 # Avoid circular imports for type checking
 if TYPE_CHECKING:
@@ -83,8 +85,8 @@ WHISPER_MODEL_INFO = {
 }
 
 OUTPUT_MODES = {
-    "immediate": "Immediate (inject each finalized segment)",
-    "deferred_until_release": "Deferred until release (inject once on stop)",
+    OUTPUT_MODE_IMMEDIATE: "Immediate (inject each finalized segment)",
+    OUTPUT_MODE_PREVIEW: "Preview before commit (review, then commit or discard)",
 }
 
 
@@ -729,6 +731,7 @@ class SettingsDialog(Gtk.Dialog):
         config_manager: "ConfigManager",
         speech_engine: "SpeechRecognitionManager",
         shortcut_update_callback: callable = None,
+        output_mode_changed_callback: Optional[Callable[[str], None]] = None,
     ):
         super().__init__(title="Vocalinux Settings", transient_for=parent, flags=0)
         self.set_decorated(True)  # Force window decorations (close button) on all WMs
@@ -740,6 +743,7 @@ class SettingsDialog(Gtk.Dialog):
         self.config_manager = config_manager
         self.speech_engine = speech_engine
         self.shortcut_update_callback = shortcut_update_callback
+        self.output_mode_changed_callback = output_mode_changed_callback
         self._test_active = False
         self._test_result = ""
         self._initializing = True  # Flag to prevent auto-apply during initialization
@@ -940,6 +944,18 @@ class SettingsDialog(Gtk.Dialog):
             widget=self.sound_effects_switch,
         )
         sound_group.add_row(sound_row)
+
+        self.test_sound_btn = Gtk.Button(label="Test Sounds")
+        self.test_sound_btn.set_tooltip_text(
+            "Play the same start and stop alerts Vocalinux uses while recording"
+        )
+        self.test_sound_btn.connect("clicked", self._on_test_sounds_clicked)
+        sound_test_row = PreferenceRow(
+            title="Sound Test",
+            subtitle="Play start/stop alerts and log player diagnostics",
+            widget=self.test_sound_btn,
+        )
+        sound_group.add_row(sound_test_row)
         self.audio_tab.pack_start(sound_group, False, False, 0)
         self.sound_effects_switch.connect("state-set", self._on_sound_effects_toggled)
 
@@ -1040,6 +1056,23 @@ class SettingsDialog(Gtk.Dialog):
         logger.info(f"Sound effects {'enabled' if enabled else 'disabled'}")
         return False
 
+    def _on_test_sounds_clicked(self, widget):
+        """Play start and stop alerts while logging diagnostics."""
+
+        def run_sound_test() -> None:
+            diagnostics = get_sound_diagnostics()
+            logger.info("Running sound test with diagnostics: %s", diagnostics)
+            start_success = play_start_sound()
+            time.sleep(0.35)
+            stop_success = play_stop_sound()
+            logger.info(
+                "Sound test completed. start_success=%s stop_success=%s",
+                start_success,
+                stop_success,
+            )
+
+        threading.Thread(target=run_sound_test, daemon=True).start()
+
     def _build_engine_section(self):
         """Build the Speech Engine section."""
         group = PreferencesGroup(title="Speech Engine")
@@ -1135,7 +1168,7 @@ class SettingsDialog(Gtk.Dialog):
         self.output_mode_combo = Gtk.ComboBoxText()
         self.output_mode_combo.set_size_request(320, -1)
         self.output_mode_combo.set_tooltip_text(
-            "Choose whether text is injected as segments finalize or once when recording stops."
+            "Choose whether text is typed immediately or held for explicit review and commit."
         )
         _prevent_scroll_on_hover(self.output_mode_combo)
         for mode, description in OUTPUT_MODES.items():
@@ -1143,7 +1176,7 @@ class SettingsDialog(Gtk.Dialog):
 
         output_mode_row = PreferenceRow(
             title="Output Mode",
-            subtitle="Immediate typing or deferred commit on release/stop",
+            subtitle="Immediate typing or preview-first review before commit",
             widget=self.output_mode_combo,
         )
         group.add_row(output_mode_row)
@@ -1510,7 +1543,7 @@ class SettingsDialog(Gtk.Dialog):
         self.current_engine = settings["engine"]
         self.language = settings["language"]
         self.current_model_size = settings["model_size"]
-        self.current_output_mode = settings.get("output_mode", "deferred_until_release")
+        self.current_output_mode = normalize_output_mode(settings.get("output_mode"))
         self.current_vad = settings.get("vad_sensitivity", 3)
         self.current_silence = settings.get("silence_timeout", 2.0)
 
@@ -1589,7 +1622,7 @@ class SettingsDialog(Gtk.Dialog):
 
         # Set spin button values
         if not self.output_mode_combo.set_active_id(self.current_output_mode):
-            self.output_mode_combo.set_active_id("deferred_until_release")
+            self.output_mode_combo.set_active_id(OUTPUT_MODE_IMMEDIATE)
         self.vad_spin.set_value(self.current_vad)
         self.silence_spin.set_value(self.current_silence)
 
@@ -1608,7 +1641,7 @@ class SettingsDialog(Gtk.Dialog):
         model_size = self.config_manager.get_model_size_for_engine(engine)
         vad_sensitivity = sr_settings.get("vad_sensitivity", 3)
         silence_timeout = sr_settings.get("silence_timeout", 2.0)
-        output_mode = sr_settings.get("output_mode", "deferred_until_release")
+        output_mode = normalize_output_mode(sr_settings.get("output_mode"))
 
         logger.info(
             f"Loaded current settings: engine={engine}, language={language}, model_size={model_size}, "
@@ -1757,6 +1790,15 @@ class SettingsDialog(Gtk.Dialog):
 
     def _on_output_mode_changed(self, widget):
         """Handle output mode selection changes."""
+        if self._initializing or self._applying_settings:
+            return
+        output_mode = normalize_output_mode(self.output_mode_combo.get_active_id())
+        logger.info("Output mode changed in settings dialog: %s", output_mode)
+        if self.output_mode_changed_callback is not None:
+            try:
+                self.output_mode_changed_callback(output_mode)
+            except Exception as e:
+                logger.warning(f"Failed to apply output mode callback immediately: {e}")
         self._auto_apply_settings()
 
     def _on_voice_commands_toggled(self, widget, state):
@@ -2026,7 +2068,7 @@ class SettingsDialog(Gtk.Dialog):
 
         vad = int(self.vad_spin.get_value())
         silence = self.silence_spin.get_value()
-        output_mode = self.output_mode_combo.get_active_id() or "deferred_until_release"
+        output_mode = normalize_output_mode(self.output_mode_combo.get_active_id())
 
         return {
             "engine": engine,
