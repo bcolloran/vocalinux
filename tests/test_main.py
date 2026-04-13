@@ -3,6 +3,7 @@ Tests for the main module functionality.
 """
 
 import argparse
+import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -649,20 +650,40 @@ class TestMainConfigPrecedence(unittest.TestCase):
                 self.assertEqual(call_kwargs["audio_device_index"], 2)
 
 
-class TestTextCallbackSpacing(unittest.TestCase):
-    """Test spacing logic in text_callback_wrapper."""
+class TestTextOutputModes(unittest.TestCase):
+    """Test immediate/deferred output handling for finalized text segments."""
 
-    def _make_callback(self):
-        """Build text_callback_wrapper with mocked dependencies."""
+    def _make_callbacks(self, output_mode: str = "immediate"):
+        """Build callbacks equivalent to main.py wiring with mocked dependencies."""
         from vocalinux.ui.action_handler import ActionHandler
 
         text_system = MagicMock()
         text_system.inject_text.return_value = True
         action_handler = ActionHandler(text_system)
+        deferred_session_segments = []
+        has_active_recording_session = False
+
+        def reset_session_buffers():
+            deferred_session_segments.clear()
+            action_handler.set_last_injected_text("")
+
+        def commit_deferred_session_text():
+            if output_mode != "deferred_until_release":
+                return
+            if not deferred_session_segments:
+                return
+
+            text_to_inject = " ".join(deferred_session_segments)
+            success = text_system.inject_text(text_to_inject)
+            if success:
+                action_handler.set_last_injected_text(text_to_inject)
 
         def text_callback_wrapper(text: str):
             text_to_inject = text.strip()
             if not text_to_inject:
+                return
+            if output_mode == "deferred_until_release":
+                deferred_session_segments.append(text_to_inject)
                 return
             if action_handler.last_injected_text and action_handler.last_injected_text.strip():
                 text_to_inject = " " + text_to_inject
@@ -670,22 +691,35 @@ class TestTextCallbackSpacing(unittest.TestCase):
             if success:
                 action_handler.set_last_injected_text(text)
 
-        return text_callback_wrapper, text_system, action_handler
+        def on_state_change(state):
+            nonlocal has_active_recording_session
+            if state == "listening":
+                has_active_recording_session = True
+                reset_session_buffers()
+            elif state == "error":
+                has_active_recording_session = False
+                reset_session_buffers()
+            elif state == "idle" and has_active_recording_session:
+                commit_deferred_session_text()
+                has_active_recording_session = False
+                reset_session_buffers()
+
+        return text_callback_wrapper, on_state_change, text_system, action_handler
 
     def test_first_segment_has_no_leading_space(self):
-        cb, text_system, _ = self._make_callback()
+        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
         cb("Hello world")
         text_system.inject_text.assert_called_once_with("Hello world")
 
     def test_subsequent_segment_gets_space_separator(self):
-        cb, text_system, _ = self._make_callback()
+        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
         cb("Hello")
         cb("world")
         calls = [c.args[0] for c in text_system.inject_text.call_args_list]
         self.assertEqual(calls, ["Hello", " world"])
 
     def test_reset_clears_leading_space(self):
-        cb, text_system, ah = self._make_callback()
+        cb, _, text_system, ah = self._make_callbacks(output_mode="immediate")
         cb("first session")
         ah.set_last_injected_text("")
         text_system.inject_text.reset_mock()
@@ -693,17 +727,17 @@ class TestTextCallbackSpacing(unittest.TestCase):
         text_system.inject_text.assert_called_once_with("second session")
 
     def test_whitespace_only_input_is_skipped(self):
-        cb, text_system, _ = self._make_callback()
+        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
         cb("   ")
         text_system.inject_text.assert_not_called()
 
     def test_input_with_leading_space_is_stripped(self):
-        cb, text_system, _ = self._make_callback()
+        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
         cb(" Hello world")
         text_system.inject_text.assert_called_once_with("Hello world")
 
     def test_multiple_segments_all_get_separators(self):
-        cb, text_system, _ = self._make_callback()
+        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
         cb("one")
         cb("two")
         cb("three")
@@ -711,11 +745,42 @@ class TestTextCallbackSpacing(unittest.TestCase):
         self.assertEqual(calls, ["one", " two", " three"])
 
     def test_space_after_punctuation_segment(self):
-        cb, text_system, _ = self._make_callback()
+        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
         cb("Hello.")
         cb("World")
         calls = [c.args[0] for c in text_system.inject_text.call_args_list]
         self.assertEqual(calls, ["Hello.", " World"])
+
+    def test_feature_flag_off_preserves_immediate_injection_behavior(self):
+        """Feature-flag OFF path keeps legacy immediate per-segment injection."""
+        with patch.dict(os.environ, {"VOCALINUX_DEFERRED_INJECTION": "0"}, clear=False):
+            cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
+            cb("alpha")
+            cb("beta")
+
+        calls = [c.args[0] for c in text_system.inject_text.call_args_list]
+        self.assertEqual(calls, ["alpha", " beta"])
+
+    def test_deferred_mode_injects_once_on_idle(self):
+        cb, on_state_change, text_system, _ = self._make_callbacks(
+            output_mode="deferred_until_release"
+        )
+        on_state_change("listening")
+        cb("Hello")
+        cb(" world ")
+        text_system.inject_text.assert_not_called()
+        on_state_change("idle")
+        text_system.inject_text.assert_called_once_with("Hello world")
+
+    def test_deferred_mode_resets_on_error(self):
+        cb, on_state_change, text_system, _ = self._make_callbacks(
+            output_mode="deferred_until_release"
+        )
+        on_state_change("listening")
+        cb("partial")
+        on_state_change("error")
+        on_state_change("idle")
+        text_system.inject_text.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping
         "voice_commands_enabled": None,  # None = auto (enabled for VOSK, disabled for Whisper)
+        "output_mode": "deferred_until_release",  # "immediate" or "deferred_until_release"
     },
     "audio": {
         "device_index": None,  # Audio input device index (None for system default)
@@ -39,6 +40,7 @@ DEFAULT_CONFIG = {
     "shortcuts": {
         "toggle_recognition": "ctrl+ctrl",  # Double-tap modifier key
         "mode": "toggle",  # "toggle" or "push_to_talk"
+        "min_hold_ms": 500,  # Minimum hold duration required to finalize in hold mode
         # Supported values: "ctrl+ctrl", "alt+alt", "shift+shift"
         # These represent double-tap shortcuts for the respective modifier keys
     },
@@ -148,11 +150,28 @@ class ConfigManager:
     def _migrate_shortcuts_config(self):
         shortcuts_config = self.config.get("shortcuts", {})
         shortcut = shortcuts_config.get("toggle_recognition")
+        changed = False
 
         if shortcut == "super+super":
             shortcuts_config["toggle_recognition"] = "ctrl+ctrl"
-            self.save_config()
+            changed = True
             logger.info("Migrated deprecated super+super shortcut to ctrl+ctrl")
+
+        min_hold_ms = shortcuts_config.get("min_hold_ms")
+        if min_hold_ms is None:
+            shortcuts_config["min_hold_ms"] = 500
+            changed = True
+        else:
+            try:
+                parsed_min_hold = max(0, int(min_hold_ms))
+            except (TypeError, ValueError):
+                parsed_min_hold = 500
+            if parsed_min_hold != min_hold_ms:
+                shortcuts_config["min_hold_ms"] = parsed_min_hold
+                changed = True
+
+        if changed:
+            self.save_config()
 
     def save_config(self):
         """Save the current configuration to the config file."""

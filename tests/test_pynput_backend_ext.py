@@ -281,6 +281,8 @@ class TestPynputKeyboardBackendOnPress:
         backend = PynputKeyboardBackend(mode="toggle")
         callback = MagicMock()
         backend.register_toggle_callback(callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+        backend._normalize_modifier_key = MagicMock(return_value=MockKey.ctrl)
 
         # First press
         backend._on_press(MockKey.ctrl)
@@ -306,6 +308,8 @@ class TestPynputKeyboardBackendOnPress:
         backend = PynputKeyboardBackend(mode="push_to_talk")
         callback = MagicMock()
         backend.register_press_callback(callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+        backend._normalize_modifier_key = MagicMock(return_value=MockKey.ctrl)
 
         backend._on_press(MockKey.ctrl)
 
@@ -355,6 +359,55 @@ class TestPynputKeyboardBackendOnPress:
         backend._normalize_modifier_key = MagicMock(side_effect=Exception("Test error"))
 
         backend._on_press(MockKey.ctrl)  # Should not raise
+
+    @patch("vocalinux.ui.keyboard_backends.pynput_backend.threading.Thread")
+    @patch("vocalinux.ui.keyboard_backends.pynput_backend.time.time")
+    def test_toggle_mode_double_tap_timing_and_cooldown(self, mock_time, mock_thread):
+        """Toggle mode should honor double-tap threshold and trigger cooldown."""
+        backend = PynputKeyboardBackend(mode="toggle")
+        callback = MagicMock()
+        backend.register_toggle_callback(callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+        backend._normalize_modifier_key = MagicMock(return_value=MockKey.ctrl)
+
+        # Press sequence:
+        # - first tap at t=1.00 (no trigger)
+        # - second tap at t=1.20 (within 0.3 threshold, triggers)
+        # - third tap at t=1.40 (within threshold but blocked by 0.5 cooldown)
+        # - fourth tap at t=2.00 (starts a new pair)
+        # - fifth tap at t=2.20 (within threshold and cooldown elapsed, triggers)
+        mock_time.side_effect = [1.00, 1.20, 1.40, 2.00, 2.20]
+
+        backend._on_press(MockKey.ctrl)
+        backend._on_press(MockKey.ctrl)
+        backend._on_press(MockKey.ctrl)
+        backend._on_press(MockKey.ctrl)
+        backend._on_press(MockKey.ctrl)
+
+        # Two accepted double-tap triggers
+        assert mock_thread.call_count == 2
+        assert mock_thread.call_args_list[0].kwargs["target"] == callback
+        assert mock_thread.call_args_list[1].kwargs["target"] == callback
+
+    @patch("vocalinux.ui.keyboard_backends.pynput_backend.threading.Thread")
+    @patch("vocalinux.ui.keyboard_backends.pynput_backend.time.time")
+    def test_push_to_talk_mode_requires_double_tap_to_arm(self, mock_time, mock_thread):
+        """Push-to-talk should arm on a quick double-tap, not on every single press."""
+        backend = PynputKeyboardBackend(mode="push_to_talk")
+        callback = MagicMock()
+        backend.register_press_callback(callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+        backend._normalize_modifier_key = MagicMock(return_value=MockKey.ctrl)
+
+        mock_time.side_effect = [10.00, 10.01, 10.02]
+
+        backend._on_press(MockKey.ctrl)
+        backend._on_press(MockKey.ctrl)
+        backend._on_press(MockKey.ctrl)
+
+        # First + second press arm recording once; third starts a new tap cycle.
+        assert mock_thread.call_count == 1
+        assert mock_thread.call_args_list[0].kwargs["target"] == callback
 
 
 class TestPynputKeyboardBackendOnRelease:
@@ -551,6 +604,7 @@ class TestPynputKeyboardBackendModifierMatching:
         mock_variants.get.return_value = {MockKey.alt_r, MockKey.alt_gr}
 
         backend._on_press(MockKey.alt_gr)
+        backend._on_press(MockKey.alt_gr)
         time.sleep(0.1)
 
         assert callback.called
@@ -566,6 +620,47 @@ class TestPynputKeyboardBackendModifierMatching:
         backend._normalize_modifier_key = MagicMock(return_value=MockKey.alt)
 
         backend._on_press(MockKey.alt_r)
+        backend._on_press(MockKey.alt_r)
         time.sleep(0.1)
 
         assert callback.called
+
+
+class TestPynputKeyboardBackendFsmBehavior:
+    """Test double-tap-and-hold FSM behavior in push_to_talk mode."""
+
+    def test_double_tap_and_hold_finalizes_when_threshold_met(self):
+        backend = PynputKeyboardBackend(mode="push_to_talk", min_hold_ms=500)
+        press_callback = MagicMock()
+        release_callback = MagicMock()
+        backend.register_press_callback(press_callback)
+        backend.register_release_callback(release_callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+
+        with patch("vocalinux.ui.keyboard_backends.pynput_backend.time.time") as mock_time:
+            mock_time.side_effect = [1.0, 1.2, 1.9]
+            backend._on_press(MockKey.ctrl)
+            backend._on_press(MockKey.ctrl)
+            backend._on_release(MockKey.ctrl)
+
+        time.sleep(0.1)
+        assert press_callback.called
+        assert release_callback.called
+
+    def test_double_tap_short_hold_does_not_finalize(self):
+        backend = PynputKeyboardBackend(mode="push_to_talk", min_hold_ms=500)
+        press_callback = MagicMock()
+        release_callback = MagicMock()
+        backend.register_press_callback(press_callback)
+        backend.register_release_callback(release_callback)
+        backend._matches_configured_modifier = MagicMock(return_value=True)
+
+        with patch("vocalinux.ui.keyboard_backends.pynput_backend.time.time") as mock_time:
+            mock_time.side_effect = [2.0, 2.2, 2.5]
+            backend._on_press(MockKey.ctrl)
+            backend._on_press(MockKey.ctrl)
+            backend._on_release(MockKey.ctrl)
+
+        time.sleep(0.1)
+        assert press_callback.called
+        assert release_callback.call_count == 0

@@ -83,9 +83,14 @@ class TrayIndicator:
         # Get configured shortcut and mode from config
         shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", "ctrl+ctrl")
         mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
 
         # Initialize keyboard shortcut manager with configured shortcut and mode
-        self.shortcut_manager = KeyboardShortcutManager(shortcut=shortcut, mode=mode)
+        self.shortcut_manager = KeyboardShortcutManager(
+            shortcut=shortcut,
+            mode=mode,
+            min_hold_ms=min_hold_ms,
+        )
 
         # Ensure icon directory exists
         os.makedirs(ICON_DIR, exist_ok=True)
@@ -104,6 +109,7 @@ class TrayIndicator:
 
         # Register for speech recognition state changes
         self.speech_engine.register_state_callback(self._on_recognition_state_changed)
+        self.speech_engine.register_preview_callback(self._on_preview_text_changed)
 
         # Initialize the icon files and validate resources
         self._init_icons()
@@ -134,6 +140,8 @@ class TrayIndicator:
 
         # Get configured mode from config
         mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
+        self.shortcut_manager.set_min_hold_ms(min_hold_ms)
         logger.info(f"Setting up keyboard shortcuts with mode: {mode}")
 
         if mode == "toggle":
@@ -217,6 +225,8 @@ class TrayIndicator:
         # Add menu items
         self._add_menu_item("Start Voice Typing", self._on_start_clicked)
         self._add_menu_item("Stop Voice Typing", self._on_stop_clicked)
+        self.preview_menu_item = self._add_menu_item("Preview: ", self._on_preview_clicked)
+        self.preview_menu_item.set_sensitive(False)
         self._add_menu_separator()
 
         self._autostart_menu_item = self._add_menu_checkbox(
@@ -405,6 +415,24 @@ class TrayIndicator:
         # Update the UI in the GTK main thread
         GLib.idle_add(self._update_ui, state)
 
+    def _on_preview_text_changed(self, preview_text: str):
+        """Handle incremental preview text updates from the recognition thread."""
+        GLib.idle_add(self._update_preview_text, preview_text)
+
+    def _on_preview_clicked(self, widget):
+        """No-op callback for the preview menu item."""
+
+    def _update_preview_text(self, preview_text: str):
+        """Update preview text in tray menu on GTK main thread."""
+        if not hasattr(self, "preview_menu_item"):
+            return False
+
+        preview = preview_text.strip()
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        self.preview_menu_item.set_label(f"Preview: {preview}")
+        return False
+
     def _update_ui(self, state: RecognitionState):
         """
         Update the UI based on the recognition state.
@@ -419,6 +447,7 @@ class TrayIndicator:
             self.indicator.set_icon_full(self.icon_names["default"], "Microphone off")
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)
+            self._update_preview_text("")
         elif state == RecognitionState.LISTENING:
             self.indicator.set_icon_full(self.icon_names["active"], "Microphone on")
             self._set_menu_item_enabled("Start Voice Typing", False)
@@ -427,10 +456,12 @@ class TrayIndicator:
             self.indicator.set_icon_full(self.icon_names["processing"], "Processing speech")
             self._set_menu_item_enabled("Start Voice Typing", False)
             self._set_menu_item_enabled("Stop Voice Typing", True)
+            self._update_preview_text("")
         elif state == RecognitionState.ERROR:
             self.indicator.set_icon_full(self.icon_names["default"], "Error")
             self._set_menu_item_enabled("Start Voice Typing", True)
             self._set_menu_item_enabled("Stop Voice Typing", False)
+            self._update_preview_text("")
 
         return False  # Remove idle callback
 
@@ -496,7 +527,12 @@ class TrayIndicator:
             logger.info("Settings dialog closed.")
             dialog.destroy()
 
-    def update_shortcut(self, shortcut: str, mode: Optional[str] = None) -> bool:
+    def update_shortcut(
+        self,
+        shortcut: str,
+        mode: Optional[str] = None,
+        min_hold_ms: Optional[int] = None,
+    ) -> bool:
         """
         Update the keyboard shortcut for toggling voice recognition.
 
@@ -505,6 +541,7 @@ class TrayIndicator:
         Args:
             shortcut: The new shortcut string (e.g., "ctrl+ctrl", "alt+alt")
             mode: Optional new mode ("toggle" or "push_to_talk"). If None, keeps current mode.
+            min_hold_ms: Optional minimum hold duration in milliseconds.
 
         Returns:
             True if the shortcut was updated successfully, False otherwise
@@ -512,6 +549,9 @@ class TrayIndicator:
         current_mode = self.shortcut_manager.mode
         mode_changed = mode is not None and mode != current_mode
         shortcut_changed = shortcut != self.shortcut_manager.shortcut
+        hold_threshold_changed = (
+            min_hold_ms is not None and min_hold_ms != self.shortcut_manager.min_hold_ms
+        )
 
         if mode_changed:
             logger.info(f"Mode changing from {current_mode} to {mode}")
@@ -525,11 +565,17 @@ class TrayIndicator:
                 logger.error(f"Failed to set shortcut: {shortcut}")
                 return False
 
+        if hold_threshold_changed:
+            assert min_hold_ms is not None
+            if not self.shortcut_manager.set_min_hold_ms(min_hold_ms):
+                logger.error(f"Failed to set min_hold_ms: {min_hold_ms}")
+                return False
+
         if mode_changed or shortcut_changed:
             self._setup_keyboard_shortcuts()
             return self.shortcut_manager.active
 
-        logger.debug("No changes needed - shortcut and mode unchanged")
+        logger.debug("No keyboard listener restart needed")
         return True
 
     def _on_about_clicked(self, widget):

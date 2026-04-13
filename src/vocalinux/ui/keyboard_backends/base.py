@@ -52,39 +52,39 @@ SHORTCUT_GROUPS = {
 SHORTCUT_MODE_DISPLAY_NAMES = {
     "ctrl+ctrl": {
         "toggle": "Double-tap Ctrl",
-        "push_to_talk": "Hold Ctrl",
+        "push_to_talk": "Double-tap + Hold Ctrl",
     },
     "alt+alt": {
         "toggle": "Double-tap Alt",
-        "push_to_talk": "Hold Alt",
+        "push_to_talk": "Double-tap + Hold Alt",
     },
     "shift+shift": {
         "toggle": "Double-tap Shift",
-        "push_to_talk": "Hold Shift",
+        "push_to_talk": "Double-tap + Hold Shift",
     },
     "left_ctrl+left_ctrl": {
         "toggle": "Double-tap Left Ctrl",
-        "push_to_talk": "Hold Left Ctrl",
+        "push_to_talk": "Double-tap + Hold Left Ctrl",
     },
     "left_alt+left_alt": {
         "toggle": "Double-tap Left Alt",
-        "push_to_talk": "Hold Left Alt",
+        "push_to_talk": "Double-tap + Hold Left Alt",
     },
     "left_shift+left_shift": {
         "toggle": "Double-tap Left Shift",
-        "push_to_talk": "Hold Left Shift",
+        "push_to_talk": "Double-tap + Hold Left Shift",
     },
     "right_ctrl+right_ctrl": {
         "toggle": "Double-tap Right Ctrl",
-        "push_to_talk": "Hold Right Ctrl",
+        "push_to_talk": "Double-tap + Hold Right Ctrl",
     },
     "right_alt+right_alt": {
         "toggle": "Double-tap Right Alt",
-        "push_to_talk": "Hold Right Alt",
+        "push_to_talk": "Double-tap + Hold Right Alt",
     },
     "right_shift+right_shift": {
         "toggle": "Double-tap Right Shift",
-        "push_to_talk": "Hold Right Shift",
+        "push_to_talk": "Double-tap + Hold Right Shift",
     },
 }
 
@@ -93,10 +93,11 @@ DEFAULT_SHORTCUT = "ctrl+ctrl"
 # Supported shortcut modes
 SHORTCUT_MODES = {
     "toggle": "Toggle (double-tap to start/stop)",
-    "push_to_talk": "Push-to-Talk (hold to speak)",
+    "push_to_talk": "Double-Tap and Hold",
 }
 
 DEFAULT_SHORTCUT_MODE = "toggle"
+DEFAULT_MIN_HOLD_MS = 500
 
 
 def get_shortcut_display_name(shortcut: str, mode: Optional[str] = None) -> str:
@@ -147,7 +148,12 @@ class KeyboardBackend(ABC):
     event listening and registering callbacks for specific shortcuts.
     """
 
-    def __init__(self, shortcut: str = DEFAULT_SHORTCUT, mode: str = DEFAULT_SHORTCUT_MODE):
+    def __init__(
+        self,
+        shortcut: str = DEFAULT_SHORTCUT,
+        mode: str = DEFAULT_SHORTCUT_MODE,
+        min_hold_ms: int = DEFAULT_MIN_HOLD_MS,
+    ):
         """
         Initialize the keyboard backend.
 
@@ -162,6 +168,7 @@ class KeyboardBackend(ABC):
         self._shortcut = shortcut
         self._mode = mode
         self._modifier_key = parse_shortcut(shortcut)
+        self._min_hold_ms = max(0, int(min_hold_ms))
 
     @property
     def shortcut(self) -> str:
@@ -183,6 +190,15 @@ class KeyboardBackend(ABC):
         if mode not in SHORTCUT_MODES:
             raise ValueError(f"Invalid mode: {mode}. Must be one of {list(SHORTCUT_MODES.keys())}")
         self._mode = mode
+
+    @property
+    def min_hold_ms(self) -> int:
+        """Get the minimum hold duration (ms) used for finalize-on-release."""
+        return self._min_hold_ms
+
+    def set_min_hold_ms(self, min_hold_ms: int) -> None:
+        """Update the minimum hold duration (ms) used for finalize-on-release."""
+        self._min_hold_ms = max(0, int(min_hold_ms))
 
     @property
     def modifier_key(self) -> str:
