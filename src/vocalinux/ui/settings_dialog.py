@@ -82,6 +82,11 @@ WHISPER_MODEL_INFO = {
     "large": {"size_mb": 2900, "desc": "Highest accuracy, slowest", "params": "1550M"},
 }
 
+OUTPUT_MODES = {
+    "immediate": "Immediate (inject each finalized segment)",
+    "deferred_until_release": "Deferred until release (inject once on stop)",
+}
+
 
 def get_available_engines():
     """
@@ -1127,6 +1132,22 @@ class SettingsDialog(Gtk.Dialog):
         """Build the Recognition Settings section."""
         group = PreferencesGroup(title="Recognition Settings")
 
+        self.output_mode_combo = Gtk.ComboBoxText()
+        self.output_mode_combo.set_size_request(320, -1)
+        self.output_mode_combo.set_tooltip_text(
+            "Choose whether text is injected as segments finalize or once when recording stops."
+        )
+        _prevent_scroll_on_hover(self.output_mode_combo)
+        for mode, description in OUTPUT_MODES.items():
+            self.output_mode_combo.append(mode, description)
+
+        output_mode_row = PreferenceRow(
+            title="Output Mode",
+            subtitle="Immediate typing or deferred commit on release/stop",
+            widget=self.output_mode_combo,
+        )
+        group.add_row(output_mode_row)
+
         # VAD Sensitivity
         self.vad_spin = Gtk.SpinButton.new_with_range(1, 5, 1)
         self.vad_spin.set_tooltip_text("Higher = more sensitive to quiet speech")
@@ -1166,6 +1187,7 @@ class SettingsDialog(Gtk.Dialog):
         self.recognition_settings_tab.pack_start(group, False, False, 0)
 
         # Connect signals
+        self.output_mode_combo.connect("changed", self._on_output_mode_changed)
         self.vad_spin.connect("value-changed", self._on_vad_changed)
         self.silence_spin.connect("value-changed", self._on_silence_changed)
         self.voice_commands_switch.connect("state-set", self._on_voice_commands_toggled)
@@ -1181,7 +1203,7 @@ class SettingsDialog(Gtk.Dialog):
         self.shortcut_mode_combo = Gtk.ComboBoxText()
         self.shortcut_mode_combo.set_size_request(200, -1)
         self.shortcut_mode_combo.set_tooltip_text(
-            "Choose between toggle (double-tap) or push-to-talk mode"
+            "Choose between toggle mode or double-tap-and-hold mode"
         )
         _prevent_scroll_on_hover(self.shortcut_mode_combo)
 
@@ -1200,6 +1222,21 @@ class SettingsDialog(Gtk.Dialog):
             widget=self.shortcut_mode_combo,
         )
         group.add_row(mode_row)
+
+        self.shortcut_min_hold_spin = Gtk.SpinButton()
+        self.shortcut_min_hold_spin.set_range(0, 5000)
+        self.shortcut_min_hold_spin.set_increments(50, 100)
+        self.shortcut_min_hold_spin.set_digits(0)
+        self.shortcut_min_hold_spin.set_size_request(120, -1)
+        _prevent_scroll_on_hover(self.shortcut_min_hold_spin)
+        current_min_hold_ms = self.config_manager.get_int("shortcuts", "min_hold_ms", 500)
+        self.shortcut_min_hold_spin.set_value(current_min_hold_ms)
+        min_hold_row = PreferenceRow(
+            title="Minimum Hold (ms)",
+            subtitle="Required key hold time before release finalizes dictation",
+            widget=self.shortcut_min_hold_spin,
+        )
+        group.add_row(min_hold_row)
 
         # Shortcut selection combo
         self.shortcut_combo = Gtk.ComboBoxText()
@@ -1255,6 +1292,7 @@ class SettingsDialog(Gtk.Dialog):
         # Connect signals
         self.shortcut_combo.connect("changed", self._on_shortcut_changed)
         self.shortcut_mode_combo.connect("changed", self._on_shortcut_mode_changed)
+        self.shortcut_min_hold_spin.connect("value-changed", self._on_shortcut_min_hold_changed)
 
         # Update UI based on initial mode
         self._update_shortcut_ui_for_mode(current_mode)
@@ -1267,9 +1305,12 @@ class SettingsDialog(Gtk.Dialog):
                 "In Toggle mode: Double-tap the key to start voice typing, double-tap again to stop."
             )
         elif mode == "push_to_talk":
-            self.shortcut_row.set_subtitle("Hold this key to speak, release to stop")
+            self.shortcut_row.set_subtitle(
+                "Double-tap, keep holding to record, release to finalize"
+            )
             self.shortcut_info_label.set_text(
-                "In Push-to-Talk mode: Hold the key down to speak, release to stop recording."
+                "In Double-Tap and Hold mode: double-tap to arm, keep holding while speaking, "
+                "then release to finalize if the hold threshold is met."
             )
 
     def _on_shortcut_mode_changed(self, widget):
@@ -1294,7 +1335,8 @@ class SettingsDialog(Gtk.Dialog):
         # Try to apply the mode change live
         if self.shortcut_update_callback:
             shortcut_id = self.shortcut_combo.get_active_id()
-            success = self.shortcut_update_callback(shortcut_id, mode_id)
+            min_hold_ms = int(self.shortcut_min_hold_spin.get_value())
+            success = self.shortcut_update_callback(shortcut_id, mode_id, min_hold_ms)
             if success:
                 self.shortcut_info_label.set_markup(
                     f"<span foreground='#26a269'>Mode updated to <b>{mode_name}</b>. "
@@ -1337,7 +1379,8 @@ class SettingsDialog(Gtk.Dialog):
         # Try to apply the shortcut change live
         if self.shortcut_update_callback:
             mode_id = self.shortcut_mode_combo.get_active_id()
-            success = self.shortcut_update_callback(shortcut_id, mode_id)
+            min_hold_ms = int(self.shortcut_min_hold_spin.get_value())
+            success = self.shortcut_update_callback(shortcut_id, mode_id, min_hold_ms)
             if success:
                 self.shortcut_info_label.set_markup(
                     f"<span foreground='#26a269'>Shortcut updated to <b>{display_name}</b>. "
@@ -1353,6 +1396,31 @@ class SettingsDialog(Gtk.Dialog):
                 f"<i>Shortcut updated to <b>{display_name}</b>. "
                 f"Restart the app for the change to take full effect.</i>"
             )
+
+    def _on_shortcut_min_hold_changed(self, widget):
+        """Handle minimum hold threshold changes."""
+        if self._initializing:
+            return
+
+        min_hold_ms = int(self.shortcut_min_hold_spin.get_value())
+        self.config_manager.set("shortcuts", "min_hold_ms", min_hold_ms)
+        self.config_manager.save_settings()
+        logger.info(f"Keyboard shortcut minimum hold changed to: {min_hold_ms}ms")
+
+        if self.shortcut_update_callback:
+            shortcut_id = self.shortcut_combo.get_active_id()
+            mode_id = self.shortcut_mode_combo.get_active_id()
+            success = self.shortcut_update_callback(shortcut_id, mode_id, min_hold_ms)
+            if success:
+                self.shortcut_info_label.set_markup(
+                    f"<span foreground='#26a269'>Minimum hold updated to "
+                    f"<b>{min_hold_ms}ms</b>. Active now!</span>"
+                )
+            else:
+                self.shortcut_info_label.set_markup(
+                    f"<i>Minimum hold updated to <b>{min_hold_ms}ms</b>. "
+                    f"Restart the app for the change to take full effect.</i>"
+                )
 
     def _build_test_section(self):
         """Build the Test Recognition section."""
@@ -1442,6 +1510,7 @@ class SettingsDialog(Gtk.Dialog):
         self.current_engine = settings["engine"]
         self.language = settings["language"]
         self.current_model_size = settings["model_size"]
+        self.current_output_mode = settings.get("output_mode", "deferred_until_release")
         self.current_vad = settings.get("vad_sensitivity", 3)
         self.current_silence = settings.get("silence_timeout", 2.0)
 
@@ -1519,6 +1588,8 @@ class SettingsDialog(Gtk.Dialog):
                 self.language = "auto"
 
         # Set spin button values
+        if not self.output_mode_combo.set_active_id(self.current_output_mode):
+            self.output_mode_combo.set_active_id("deferred_until_release")
         self.vad_spin.set_value(self.current_vad)
         self.silence_spin.set_value(self.current_silence)
 
@@ -1537,10 +1608,11 @@ class SettingsDialog(Gtk.Dialog):
         model_size = self.config_manager.get_model_size_for_engine(engine)
         vad_sensitivity = sr_settings.get("vad_sensitivity", 3)
         silence_timeout = sr_settings.get("silence_timeout", 2.0)
+        output_mode = sr_settings.get("output_mode", "deferred_until_release")
 
         logger.info(
             f"Loaded current settings: engine={engine}, language={language}, model_size={model_size}, "
-            f"vad={vad_sensitivity}, silence={silence_timeout}"
+            f"vad={vad_sensitivity}, silence={silence_timeout}, output_mode={output_mode}"
         )
 
         return {
@@ -1549,6 +1621,7 @@ class SettingsDialog(Gtk.Dialog):
             "model_size": model_size,
             "vad_sensitivity": vad_sensitivity,
             "silence_timeout": silence_timeout,
+            "output_mode": output_mode,
         }
 
     def _populate_model_options(self):
@@ -1680,6 +1753,10 @@ class SettingsDialog(Gtk.Dialog):
 
     def _on_silence_changed(self, widget):
         """Handle changes in silence timeout."""
+        self._auto_apply_settings()
+
+    def _on_output_mode_changed(self, widget):
+        """Handle output mode selection changes."""
         self._auto_apply_settings()
 
     def _on_voice_commands_toggled(self, widget, state):
@@ -1949,6 +2026,7 @@ class SettingsDialog(Gtk.Dialog):
 
         vad = int(self.vad_spin.get_value())
         silence = self.silence_spin.get_value()
+        output_mode = self.output_mode_combo.get_active_id() or "deferred_until_release"
 
         return {
             "engine": engine,
@@ -1956,6 +2034,7 @@ class SettingsDialog(Gtk.Dialog):
             "language": language,
             "vad_sensitivity": vad,
             "silence_timeout": silence,
+            "output_mode": output_mode,
         }
 
     def _on_test_clicked(self, widget):

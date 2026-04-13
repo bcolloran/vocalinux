@@ -25,7 +25,7 @@ except ImportError:
     ecodes = None  # type: ignore
     EVDEV_AVAILABLE = False
 
-from .base import DEFAULT_SHORTCUT, DEFAULT_SHORTCUT_MODE, KeyboardBackend, parse_shortcut
+from .base import DEFAULT_MIN_HOLD_MS, DEFAULT_SHORTCUT, DEFAULT_SHORTCUT_MODE, KeyboardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,12 @@ class EvdevKeyboardBackend(KeyboardBackend):
     to read from /dev/input/event* devices (member of 'input' group).
     """
 
-    def __init__(self, shortcut: str = DEFAULT_SHORTCUT, mode: str = DEFAULT_SHORTCUT_MODE):
+    def __init__(
+        self,
+        shortcut: str = DEFAULT_SHORTCUT,
+        mode: str = DEFAULT_SHORTCUT_MODE,
+        min_hold_ms: int = DEFAULT_MIN_HOLD_MS,
+    ):
         """
         Initialize the evdev keyboard backend.
 
@@ -148,7 +153,7 @@ class EvdevKeyboardBackend(KeyboardBackend):
             shortcut: The shortcut string to listen for (e.g., "ctrl+ctrl")
             mode: The shortcut mode ("toggle" or "push_to_talk")
         """
-        super().__init__(shortcut, mode)
+        super().__init__(shortcut, mode, min_hold_ms=min_hold_ms)
         self.devices: list[InputDevice] = []
         self.device_fds: list[int] = []
         self.running = False
@@ -158,6 +163,9 @@ class EvdevKeyboardBackend(KeyboardBackend):
         self.last_key_press_time = 0
         self.double_tap_threshold = 0.3  # seconds
         self.key_pressed_devices: set[int] = set()
+        self._push_last_tap_time = 0.0
+        self._push_tap_count = 0
+        self._push_recording_devices: dict[int, float] = {}
 
         self._devices_lock = threading.Lock()
         self._dropped_devices: set[int] = set()  # fds with SYN_DROPPED pending
@@ -249,6 +257,9 @@ class EvdevKeyboardBackend(KeyboardBackend):
         self.device_fds = []
         self.key_pressed_devices = set()
         self._dropped_devices = set()
+        self._push_last_tap_time = 0.0
+        self._push_tap_count = 0
+        self._push_recording_devices = {}
 
         for device_path in device_paths:
             try:
@@ -398,10 +409,23 @@ class EvdevKeyboardBackend(KeyboardBackend):
                             self.last_trigger_time = current_time
                             threading.Thread(target=self.double_tap_callback, daemon=True).start()
                     elif self._mode == "push_to_talk":
-                        # Trigger on press
-                        if self.key_press_callback is not None:
-                            logger.debug(f"Key press {self._modifier_key} detected (evdev)")
-                            threading.Thread(target=self.key_press_callback, daemon=True).start()
+                        time_since_last_tap = current_time - self._push_last_tap_time
+                        if time_since_last_tap <= self.double_tap_threshold:
+                            self._push_tap_count += 1
+                        else:
+                            self._push_tap_count = 1
+                        self._push_last_tap_time = current_time
+
+                        if self._push_tap_count >= 2:
+                            self._push_tap_count = 0
+                            self._push_recording_devices[device_id] = current_time
+                            if self.key_press_callback is not None:
+                                logger.debug(
+                                    f"Double-tap {self._modifier_key} armed recording (evdev)"
+                                )
+                                threading.Thread(
+                                    target=self.key_press_callback, daemon=True
+                                ).start()
 
                     self.last_key_press_time = current_time
 
@@ -409,10 +433,23 @@ class EvdevKeyboardBackend(KeyboardBackend):
                     self.key_pressed_devices.discard(device_id)
 
                     if self._mode == "push_to_talk":
-                        # Trigger on release
-                        if self.key_release_callback is not None:
-                            logger.debug(f"Key release {self._modifier_key} detected (evdev)")
+                        hold_started_at = self._push_recording_devices.pop(device_id, None)
+                        if hold_started_at is None:
+                            return
+                        hold_duration_ms = int((time.time() - hold_started_at) * 1000)
+                        if (
+                            hold_duration_ms >= self.min_hold_ms
+                            and self.key_release_callback is not None
+                        ):
+                            logger.debug(
+                                f"Key release {self._modifier_key} finalized ({hold_duration_ms}ms, evdev)"
+                            )
                             threading.Thread(target=self.key_release_callback, daemon=True).start()
+                        else:
+                            logger.debug(
+                                f"Key release {self._modifier_key} ignored "
+                                f"({hold_duration_ms}ms < {self.min_hold_ms}ms, evdev)"
+                            )
 
         except Exception as e:
             logger.error(f"Error handling key event: {e}")

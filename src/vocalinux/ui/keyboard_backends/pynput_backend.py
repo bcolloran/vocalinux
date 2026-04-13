@@ -19,7 +19,7 @@ except ImportError:
     keyboard = None  # type: ignore
     PYNPUT_AVAILABLE = False
 
-from .base import DEFAULT_SHORTCUT, DEFAULT_SHORTCUT_MODE, KeyboardBackend
+from .base import DEFAULT_MIN_HOLD_MS, DEFAULT_SHORTCUT, DEFAULT_SHORTCUT_MODE, KeyboardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,12 @@ class PynputKeyboardBackend(KeyboardBackend):
     due to Wayland's security restrictions.
     """
 
-    def __init__(self, shortcut: str = DEFAULT_SHORTCUT, mode: str = DEFAULT_SHORTCUT_MODE):
+    def __init__(
+        self,
+        shortcut: str = DEFAULT_SHORTCUT,
+        mode: str = DEFAULT_SHORTCUT_MODE,
+        min_hold_ms: int = DEFAULT_MIN_HOLD_MS,
+    ):
         """
         Initialize the pynput keyboard backend.
 
@@ -106,12 +111,16 @@ class PynputKeyboardBackend(KeyboardBackend):
             shortcut: The shortcut string to listen for (e.g., "ctrl+ctrl")
             mode: The shortcut mode ("toggle" or "push_to_talk")
         """
-        super().__init__(shortcut, mode)
+        super().__init__(shortcut, mode, min_hold_ms=min_hold_ms)
         self.listener = None
         self.last_trigger_time = 0
         self.last_key_press_time = 0
         self.double_tap_threshold = 0.3  # seconds
         self.current_keys = set()
+        self._push_last_tap_time = 0.0
+        self._push_tap_count = 0
+        self._push_recording_active = False
+        self._push_hold_started_at = 0.0
 
         if not PYNPUT_AVAILABLE:
             logger.error("pynput library not available")
@@ -163,6 +172,10 @@ class PynputKeyboardBackend(KeyboardBackend):
             f"Starting pynput keyboard listener for shortcut: {self._shortcut} (mode: {self._mode})"
         )
         self.current_keys = set()
+        self._push_last_tap_time = 0.0
+        self._push_tap_count = 0
+        self._push_recording_active = False
+        self._push_hold_started_at = 0.0
 
         try:
             self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
@@ -218,9 +231,22 @@ class PynputKeyboardBackend(KeyboardBackend):
                         self.last_trigger_time = current_time
                         threading.Thread(target=self.double_tap_callback, daemon=True).start()
                 elif self._mode == "push_to_talk":
-                    if self.key_press_callback is not None:
-                        logger.debug(f"Key press {self._modifier_key} detected (pynput)")
-                        threading.Thread(target=self.key_press_callback, daemon=True).start()
+                    time_since_last_tap = current_time - self._push_last_tap_time
+                    if time_since_last_tap <= self.double_tap_threshold:
+                        self._push_tap_count += 1
+                    else:
+                        self._push_tap_count = 1
+                    self._push_last_tap_time = current_time
+
+                    if self._push_tap_count >= 2:
+                        self._push_tap_count = 0
+                        self._push_recording_active = True
+                        self._push_hold_started_at = current_time
+                        if self.key_press_callback is not None:
+                            logger.debug(
+                                f"Double-tap {self._modifier_key} armed recording (pynput)"
+                            )
+                            threading.Thread(target=self.key_press_callback, daemon=True).start()
 
                 self.last_key_press_time = current_time
         except Exception as e:
@@ -235,9 +261,22 @@ class PynputKeyboardBackend(KeyboardBackend):
             matched = self._matches_configured_modifier(key)
 
             if self._mode == "push_to_talk" and matched:
-                if self.key_release_callback is not None:
-                    logger.debug(f"Key release {self._modifier_key} detected (pynput)")
-                    threading.Thread(target=self.key_release_callback, daemon=True).start()
+                if self._push_recording_active:
+                    hold_duration_ms = int((time.time() - self._push_hold_started_at) * 1000)
+                    self._push_recording_active = False
+                    if (
+                        hold_duration_ms >= self.min_hold_ms
+                        and self.key_release_callback is not None
+                    ):
+                        logger.debug(
+                            f"Key release {self._modifier_key} finalized ({hold_duration_ms}ms, pynput)"
+                        )
+                        threading.Thread(target=self.key_release_callback, daemon=True).start()
+                    else:
+                        logger.debug(
+                            f"Key release {self._modifier_key} ignored "
+                            f"({hold_duration_ms}ms < {self.min_hold_ms}ms, pynput)"
+                        )
 
         except Exception as e:
             logger.error(f"Error in pynput key release handling: {e}")

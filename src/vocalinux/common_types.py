@@ -37,6 +37,10 @@ class SpeechRecognitionManagerProtocol(Protocol):
         """Register a callback for recognized text."""
         ...
 
+    def register_preview_callback(self, callback: Callable[[str], None]) -> None:
+        """Register a callback for incremental preview text."""
+        ...
+
 
 class TextInjectorProtocol(Protocol):
     """Protocol defining the interface for TextInjector."""
