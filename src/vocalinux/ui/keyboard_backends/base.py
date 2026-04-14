@@ -165,6 +165,7 @@ class KeyboardBackend(ABC):
         self.double_tap_callback: Optional[Callback] = None
         self.key_press_callback: Optional[Callback] = None
         self.key_release_callback: Optional[Callback] = None
+        self.escape_callback: Optional[Callback] = None
         self._shortcut = shortcut
         self._mode = mode
         self._modifier_key = parse_shortcut(shortcut)
@@ -276,3 +277,12 @@ class KeyboardBackend(ABC):
             callback: Function to call when the shortcut key is released
         """
         self.key_release_callback = callback
+
+    def register_escape_callback(self, callback: Optional[Callback]) -> None:
+        """
+        Register a callback for global Escape key presses.
+
+        Args:
+            callback: Function to call when Escape is pressed
+        """
+        self.escape_callback = callback

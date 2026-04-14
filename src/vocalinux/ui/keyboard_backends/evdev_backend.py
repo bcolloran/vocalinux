@@ -39,6 +39,7 @@ KEY_LEFTSHIFT = 42
 KEY_RIGHTSHIFT = 54
 KEY_LEFTMETA = 125  # Super/Windows key
 KEY_RIGHTMETA = 126
+KEY_ESC = 1
 
 # Map modifier key names to evdev key codes
 MODIFIER_KEY_CODES: dict[str, set[int]] = {
@@ -387,6 +388,11 @@ class EvdevKeyboardBackend(KeyboardBackend):
         try:
             code = event.code
             value = event.value  # 0 = release, 1 = press, 2 = repeat
+
+            if code == KEY_ESC and value == 1 and self.escape_callback is not None:
+                logger.debug("Escape key detected (evdev)")
+                threading.Thread(target=self.escape_callback, daemon=True).start()
+                return
 
             target_codes = self._get_target_key_codes()
 

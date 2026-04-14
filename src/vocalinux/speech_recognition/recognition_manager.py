@@ -1626,7 +1626,8 @@ class SpeechRecognitionManager:
         self._update_state(RecognitionState.LISTENING)
 
         # Play the start sound
-        play_start_sound()
+        start_sound_played = play_start_sound()
+        logger.info("Start sound playback requested. success=%s", start_sound_played)
 
         # Set recording flag
         self.should_record = True
@@ -1685,7 +1686,8 @@ class SpeechRecognitionManager:
                 self.audio_buffer = []
 
         # Now play the stop sound (after recording has stopped)
-        play_stop_sound()
+        stop_sound_played = play_stop_sound()
+        logger.info("Stop sound playback requested. success=%s", stop_sound_played)
 
         # Wake up recognition thread so it can drain queued segments and stop
         self._signal_recognition_stop()

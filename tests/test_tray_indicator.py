@@ -194,6 +194,51 @@ class TestTrayIndicator(unittest.TestCase):
         self.tray_indicator._on_stop_clicked(None)
         self.mock_speech_engine.stop_recognition.assert_called_once()
 
+    def test_push_to_talk_preview_opens_window_on_start(self):
+        """HTT opens the preview window immediately, regardless of global output mode."""
+        self.tray_indicator.output_controller = MagicMock()
+        self.tray_indicator.output_controller.output_mode = "immediate_injection"
+        self.tray_indicator.preview_window = MagicMock()
+
+        def start_side_effect(mode="toggle"):
+            self.mock_speech_engine.state = self.RecognitionState.LISTENING
+
+        self.mock_speech_engine.state = self.RecognitionState.IDLE
+        self.mock_speech_engine.start_recognition.side_effect = start_side_effect
+
+        self.tray_indicator._start_recognition()
+
+        self.tray_indicator.output_controller.begin_push_to_talk_preview_session.assert_called_once()
+        self.tray_indicator.preview_window.set_session_active.assert_called_with(True)
+        self.mock_speech_engine.start_recognition.assert_called_once_with(mode="push_to_talk")
+
+    def test_push_to_talk_preview_commits_live_preview_on_release(self):
+        """HTT release commits live preview before stopping recognition."""
+        self.tray_indicator.output_controller = MagicMock()
+        self.tray_indicator.preview_window = MagicMock()
+        self.tray_indicator._push_to_talk_preview_active = True
+        self.mock_speech_engine.state = self.RecognitionState.LISTENING
+
+        self.tray_indicator._stop_recognition()
+
+        self.tray_indicator.output_controller.commit_live_preview_text.assert_called_once()
+        self.tray_indicator.preview_window.set_session_active.assert_called_with(False)
+        self.mock_speech_engine.stop_recognition.assert_called_once()
+
+    def test_escape_cancels_active_push_to_talk_preview(self):
+        """Escape cancels an active HTT preview session."""
+        self.tray_indicator.output_controller = MagicMock()
+        self.tray_indicator.preview_window = MagicMock()
+        self.tray_indicator._push_to_talk_preview_active = True
+        self.mock_speech_engine.state = self.RecognitionState.LISTENING
+
+        self.tray_indicator._on_escape_pressed()
+
+        self.tray_indicator.output_controller.cancel_live_preview_session.assert_called_once()
+        self.tray_indicator.preview_window.set_session_active.assert_called_with(False)
+        self.mock_speech_engine.stop_recognition.assert_called_once()
+        self.assertTrue(self.tray_indicator._ignore_next_release)
+
     def test_on_recognition_state_changed(self):
         """Test state change callback invokes update_ui via GLib.idle_add."""
         # The _on_recognition_state_changed method calls GLib.idle_add(_update_ui, state)

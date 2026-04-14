@@ -106,11 +106,29 @@ NO_WHISPER_EXPLICIT="no"
 NON_INTERACTIVE="no"
 INTERACTIVE_MODE="yes"  # Default to interactive mode
 AUTO_MODE="no"
+WHISPERCPP_BACKEND=""
+FINAL_INSTALLED_ENGINE=""
+FINAL_WHISPERCPP_BACKEND=""
+PREVIOUS_INSTALL_CONFIG_FOUND="no"
+PREVIOUS_SELECTED_ENGINE=""
+PREVIOUS_WHISPERCPP_BACKEND=""
+PREVIOUS_SKIP_MODELS="no"
+PREVIOUS_EFFECTIVE_ENGINE=""
+PREVIOUS_INSTALL_MODE=""
+PREVIOUS_INSTALL_CONFIG_SOURCE=""
 HAS_NVIDIA_GPU="unknown"
 GPU_NAME=""
 GPU_MEMORY=""
 HAS_VULKAN="no"
 VULKAN_DEVICE=""
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vocalinux"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vocalinux"
+DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+INSTALL_CONFIG_FILE="$CONFIG_DIR/install_config.json"
+INSTALL_CONFIG_DATA_FILE="$DATA_DIR/install_config.json"
+APP_CONFIG_FILE="$CONFIG_DIR/config.json"
 
 # Detect if running non-interactively (e.g., via curl | bash)
 # If stdin is a pipe but /dev/tty exists, redirect stdin so user input works normally.
@@ -799,6 +817,325 @@ print_header() {
     echo "============================================================"
 }
 
+get_json_python() {
+    if command_exists python3; then
+        echo "python3"
+        return 0
+    fi
+
+    if command_exists python; then
+        echo "python"
+        return 0
+    fi
+
+    return 1
+}
+
+format_engine_display() {
+    case "$1" in
+        whisper_cpp)
+            echo "Whisper.cpp"
+            ;;
+        whisper)
+            echo "Whisper (OpenAI)"
+            ;;
+        vosk)
+            echo "VOSK"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
+format_backend_choice_display() {
+    case "$1" in
+        gpu)
+            echo "GPU (Vulkan/CUDA)"
+            ;;
+        cpu)
+            echo "CPU (Pre-built)"
+            ;;
+        *)
+            echo "Auto-detect"
+            ;;
+    esac
+}
+
+format_models_display() {
+    if [[ "$1" == "yes" ]]; then
+        echo "Download on first use"
+    else
+        echo "Download now (recommended)"
+    fi
+}
+
+load_previous_install_config() {
+    local PYTHON_BIN
+    if ! PYTHON_BIN=$(get_json_python); then
+        print_warning "Python is unavailable, so previous install configuration cannot be read."
+        return 1
+    fi
+
+    local CONFIG_SOURCE=""
+    local PARSED_CONFIG=""
+
+    for CANDIDATE_PATH in "$INSTALL_CONFIG_FILE" "$INSTALL_CONFIG_DATA_FILE"; do
+        if [[ ! -f "$CANDIDATE_PATH" ]]; then
+            continue
+        fi
+
+        if PARSED_CONFIG=$("$PYTHON_BIN" - "$CANDIDATE_PATH" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+selected_engine = data.get("selected_engine", "")
+if selected_engine not in {"whisper_cpp", "whisper", "vosk"}:
+    raise SystemExit(1)
+
+backend_choice = data.get("whispercpp_backend_choice")
+if backend_choice not in {"cpu", "gpu", "", None}:
+    raise SystemExit(1)
+
+skip_models = data.get("skip_models", False)
+if not isinstance(skip_models, bool):
+    skip_models = False
+
+effective_engine = data.get("effective_engine") or selected_engine
+if effective_engine not in {"whisper_cpp", "whisper", "vosk"}:
+    effective_engine = selected_engine
+
+install_mode = data.get("install_mode", "")
+if install_mode not in {"interactive", "automatic"}:
+    install_mode = ""
+
+print(f"selected_engine={selected_engine}")
+print(f"whispercpp_backend_choice={backend_choice or ''}")
+print(f"skip_models={'yes' if skip_models else 'no'}")
+print(f"effective_engine={effective_engine}")
+print(f"install_mode={install_mode}")
+PY
+        ); then
+            CONFIG_SOURCE="$CANDIDATE_PATH"
+            break
+        fi
+
+        print_warning "Ignoring invalid previous install configuration: $CANDIDATE_PATH"
+    done
+
+    if [[ -z "$CONFIG_SOURCE" && -f "$APP_CONFIG_FILE" ]]; then
+        if PARSED_CONFIG=$("$PYTHON_BIN" - "$APP_CONFIG_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+speech = data.get("speech_recognition", {})
+selected_engine = speech.get("engine", "")
+if selected_engine not in {"whisper_cpp", "whisper", "vosk"}:
+    raise SystemExit(1)
+
+print(f"selected_engine={selected_engine}")
+print("whispercpp_backend_choice=")
+print("skip_models=no")
+print(f"effective_engine={selected_engine}")
+print("install_mode=")
+PY
+        ); then
+            CONFIG_SOURCE="$APP_CONFIG_FILE"
+        else
+            print_warning "Ignoring invalid application configuration fallback: $APP_CONFIG_FILE"
+        fi
+    fi
+
+    if [[ -z "$CONFIG_SOURCE" ]]; then
+        return 1
+    fi
+
+    PREVIOUS_SELECTED_ENGINE=""
+    PREVIOUS_WHISPERCPP_BACKEND=""
+    PREVIOUS_SKIP_MODELS="no"
+    PREVIOUS_EFFECTIVE_ENGINE=""
+    PREVIOUS_INSTALL_MODE=""
+    PREVIOUS_INSTALL_CONFIG_SOURCE="$CONFIG_SOURCE"
+
+    while IFS='=' read -r KEY VALUE; do
+        case "$KEY" in
+            selected_engine)
+                PREVIOUS_SELECTED_ENGINE="$VALUE"
+                ;;
+            whispercpp_backend_choice)
+                PREVIOUS_WHISPERCPP_BACKEND="$VALUE"
+                ;;
+            skip_models)
+                PREVIOUS_SKIP_MODELS="$VALUE"
+                ;;
+            effective_engine)
+                PREVIOUS_EFFECTIVE_ENGINE="$VALUE"
+                ;;
+            install_mode)
+                PREVIOUS_INSTALL_MODE="$VALUE"
+                ;;
+        esac
+    done <<< "$PARSED_CONFIG"
+
+    PREVIOUS_INSTALL_CONFIG_FOUND="yes"
+    return 0
+}
+
+apply_previous_install_config() {
+    SELECTED_ENGINE="$PREVIOUS_SELECTED_ENGINE"
+    WHISPERCPP_BACKEND="$PREVIOUS_WHISPERCPP_BACKEND"
+    SKIP_MODELS="$PREVIOUS_SKIP_MODELS"
+
+    ENGINE_DISPLAY="$(format_engine_display "$SELECTED_ENGINE")"
+    MODELS_DISPLAY="$(format_models_display "$SKIP_MODELS")"
+
+    if [[ "$SELECTED_ENGINE" == "whisper_cpp" ]]; then
+        BACKEND_DISPLAY="$(format_backend_choice_display "$WHISPERCPP_BACKEND")"
+    else
+        BACKEND_DISPLAY=""
+    fi
+}
+
+maybe_use_previous_install_config() {
+    if ! load_previous_install_config; then
+        return 1
+    fi
+
+    print_header "Previous Installation Configuration"
+    echo "Found previous install configuration in:"
+    echo "  $PREVIOUS_INSTALL_CONFIG_SOURCE"
+    echo ""
+    echo "  Engine: $(format_engine_display "$PREVIOUS_SELECTED_ENGINE")"
+    if [[ "$PREVIOUS_SELECTED_ENGINE" == "whisper_cpp" ]]; then
+        echo "  Backend: $(format_backend_choice_display "$PREVIOUS_WHISPERCPP_BACKEND")"
+    fi
+    echo "  Models: $(format_models_display "$PREVIOUS_SKIP_MODELS")"
+    if [[ -n "$PREVIOUS_EFFECTIVE_ENGINE" && "$PREVIOUS_EFFECTIVE_ENGINE" != "$PREVIOUS_SELECTED_ENGINE" ]]; then
+        echo "  Previous effective engine: $(format_engine_display "$PREVIOUS_EFFECTIVE_ENGINE")"
+    fi
+    if [[ -n "$PREVIOUS_INSTALL_MODE" ]]; then
+        echo "  Previous install mode: $PREVIOUS_INSTALL_MODE"
+    fi
+    echo ""
+
+    read -p "Use previous installation configuration? (Y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        return 1
+    fi
+
+    apply_previous_install_config
+    print_info "Using previous installation configuration. Skipping guided setup prompts."
+    echo ""
+    print_header "Installation Summary"
+    echo ""
+    echo "  Speech Engine: $ENGINE_DISPLAY"
+    if [[ "$SELECTED_ENGINE" == "whisper_cpp" ]]; then
+        echo "  Backend: ${BACKEND_DISPLAY:-Auto-detect}"
+    fi
+    echo "  Models: $MODELS_DISPLAY"
+    echo "  Install Location: ${INSTALL_DIR:-\$HOME/.local/share/vocalinux}"
+    echo ""
+    return 0
+}
+
+save_install_config() {
+    local SELECTED_ENGINE_VALUE="${SELECTED_ENGINE:-whisper_cpp}"
+    local EFFECTIVE_ENGINE_VALUE="${FINAL_INSTALLED_ENGINE:-$SELECTED_ENGINE_VALUE}"
+    local INSTALL_MODE_VALUE="interactive"
+    local BACKEND_CHOICE_JSON="null"
+    local EFFECTIVE_BACKEND_JSON="null"
+    local SKIP_MODELS_JSON="false"
+    local INSTALL_CONFIG_JSON=""
+    local SAVE_COUNT=0
+
+    if [[ "$NON_INTERACTIVE" == "yes" || "$AUTO_MODE" == "yes" ]]; then
+        INSTALL_MODE_VALUE="automatic"
+    fi
+
+    if [[ -n "${WHISPERCPP_BACKEND:-}" ]]; then
+        BACKEND_CHOICE_JSON="\"$WHISPERCPP_BACKEND\""
+    fi
+
+    if [[ -n "${FINAL_WHISPERCPP_BACKEND:-}" ]]; then
+        EFFECTIVE_BACKEND_JSON="\"$FINAL_WHISPERCPP_BACKEND\""
+    fi
+
+    if [[ "$SKIP_MODELS" == "yes" ]]; then
+        SKIP_MODELS_JSON="true"
+    fi
+
+    INSTALL_CONFIG_JSON=$(cat <<EOF
+{
+  "version": 1,
+  "selected_engine": "$SELECTED_ENGINE_VALUE",
+  "whispercpp_backend_choice": $BACKEND_CHOICE_JSON,
+  "skip_models": $SKIP_MODELS_JSON,
+  "install_mode": "$INSTALL_MODE_VALUE",
+  "effective_engine": "$EFFECTIVE_ENGINE_VALUE",
+  "effective_whispercpp_backend": $EFFECTIVE_BACKEND_JSON,
+  "install_tag": "${INSTALL_TAG:-unknown}"
+}
+EOF
+)
+
+    write_install_config_file() {
+        local TARGET_FILE="$1"
+        local TARGET_DIR
+        TARGET_DIR=$(dirname "$TARGET_FILE")
+
+        mkdir -p "$TARGET_DIR" || {
+            print_warning "Failed to create installer config directory: $TARGET_DIR"
+            return 1
+        }
+
+        local TMP_INSTALL_CONFIG
+        TMP_INSTALL_CONFIG=$(mktemp "${TARGET_FILE}.tmp.XXXXXX") || {
+            print_warning "Failed to create temporary installer config file for $TARGET_FILE"
+            return 1
+        }
+
+        printf "%s\n" "$INSTALL_CONFIG_JSON" > "$TMP_INSTALL_CONFIG" || {
+            rm -f "$TMP_INSTALL_CONFIG"
+            print_warning "Failed to write temporary installer config file for $TARGET_FILE"
+            return 1
+        }
+
+        mv "$TMP_INSTALL_CONFIG" "$TARGET_FILE" || {
+            rm -f "$TMP_INSTALL_CONFIG"
+            print_warning "Failed to save installer configuration to $TARGET_FILE"
+            return 1
+        }
+
+        print_info "Saved installer configuration to $TARGET_FILE"
+        return 0
+    }
+
+    if write_install_config_file "$INSTALL_CONFIG_FILE"; then
+        SAVE_COUNT=$((SAVE_COUNT + 1))
+    fi
+
+    if write_install_config_file "$INSTALL_CONFIG_DATA_FILE"; then
+        SAVE_COUNT=$((SAVE_COUNT + 1))
+    fi
+
+    if [[ "$SAVE_COUNT" -eq 0 ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
 # Function to run interactive guided installation
 run_interactive_install() {
     clear_screen
@@ -815,6 +1152,10 @@ EOF
     echo "All speech engines are 100% offline, local, and private."
     echo "Your voice data never leaves your computer."
     echo ""
+
+    if maybe_use_previous_install_config; then
+        return 0
+    fi
 
     # Step 1: Detect and display system info
     print_header "Step 1: Your System"
@@ -1069,6 +1410,29 @@ else
 fi
 
 # Handle installation mode selection
+if [[ "$INTERACTIVE_MODE" == "ask" ]]; then
+    if load_previous_install_config; then
+        echo ""
+        echo "Previous installation configuration found:"
+        echo "  Source: $PREVIOUS_INSTALL_CONFIG_SOURCE"
+        echo "  Engine: $(format_engine_display "$PREVIOUS_SELECTED_ENGINE")"
+        if [[ "$PREVIOUS_SELECTED_ENGINE" == "whisper_cpp" ]]; then
+            echo "  Backend: $(format_backend_choice_display "$PREVIOUS_WHISPERCPP_BACKEND")"
+        fi
+        echo "  Models: $(format_models_display "$PREVIOUS_SKIP_MODELS")"
+        echo ""
+        read -p "Use previous installation configuration? (Y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            apply_previous_install_config
+            INTERACTIVE_MODE="no"
+            NON_INTERACTIVE="no"
+            print_info "Using previous installation configuration. Skipping installer mode questions."
+            echo ""
+        fi
+    fi
+fi
+
 if [[ "$INTERACTIVE_MODE" == "ask" ]]; then
     # Running via curl pipe but we have a terminal - ask user preference
     echo ""
@@ -1458,12 +1822,6 @@ install_system_dependencies() {
 
 # Install system dependencies
 install_system_dependencies
-
-# Define XDG directories
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vocalinux"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vocalinux"
-DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
 
 # Function to detect and install text input tools
 install_text_input_tools() {
@@ -1958,6 +2316,8 @@ install_python_package() {
                     }
                 fi
 
+                FINAL_INSTALLED_ENGINE="whisper_cpp"
+                FINAL_WHISPERCPP_BACKEND="$GPU_BACKEND"
                 print_success "pywhispercpp installed with $GPU_BACKEND backend"
                 echo ""
                 ;;
@@ -1991,6 +2351,8 @@ install_python_package() {
                 fi
 
                 if [[ "$WHISPER_INSTALL_SUCCESS" == "true" ]]; then
+                    FINAL_INSTALLED_ENGINE="whisper"
+                    FINAL_WHISPERCPP_BACKEND=""
                     # Create config with whisper as default
                     local WHISPER_CONFIG="$CONFIG_DIR/config.json"
                     if [ ! -f "$WHISPER_CONFIG" ]; then
@@ -2041,6 +2403,8 @@ WHISPER_CONFIG
                         print_error "Please try installing manually: pip install pywhispercpp"
                         return 1
                     }
+                    FINAL_INSTALLED_ENGINE="whisper_cpp"
+                    FINAL_WHISPERCPP_BACKEND="CPU"
                     print_success "Installed whisper.cpp as fallback"
 
                     # Create config with whisper_cpp as default
@@ -2082,6 +2446,8 @@ FALLBACK_CONFIG
             vosk)
                 print_info "Installing VOSK (lightweight option)..."
                 print_info "VOSK is fast and works well on older systems."
+                FINAL_INSTALLED_ENGINE="vosk"
+                FINAL_WHISPERCPP_BACKEND=""
 
                 # Create config with vosk as default
                 local VOSK_CONFIG_FILE="$CONFIG_DIR/config.json"
@@ -2638,6 +3004,8 @@ else
     print_info "Models will be downloaded automatically on first application run"
 fi
 
+save_install_config || print_warning "Failed to persist installer configuration."
+
 # Update icon cache
 update_icon_cache
 
@@ -2767,10 +3135,14 @@ EOF
     case "$ENGINE_INFO" in
         whisper_cpp)
             ENGINE_DISPLAY_NAME="Whisper.cpp"
-            if [[ "${WHISPERCPP_BACKEND}" == "gpu" ]]; then
-                BACKEND_INFO="GPU Accelerated"
-            else
+            if [[ -n "${FINAL_WHISPERCPP_BACKEND}" ]]; then
+                BACKEND_INFO="$FINAL_WHISPERCPP_BACKEND"
+            elif [[ "${WHISPERCPP_BACKEND}" == "gpu" ]]; then
+                BACKEND_INFO="GPU Requested"
+            elif [[ "${WHISPERCPP_BACKEND}" == "cpu" ]]; then
                 BACKEND_INFO="CPU"
+            else
+                BACKEND_INFO="Auto-detect"
             fi
             ;;
         whisper)
@@ -2811,7 +3183,7 @@ EOF
     echo "   • Right-click for menu options"
     echo ""
     echo "3. Start dictating!"
-    echo -e "   \e[1mDouble-tap Ctrl\e[0m anywhere to toggle recording"
+    echo -e "   \e[1mDouble-tap and hold Ctrl\e[0m to transcribe"
     echo ""
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -2819,9 +3191,9 @@ EOF
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "1. Open any text editor (gedit, VS Code, LibreOffice, etc.)"
-    echo "2. Double-tap Ctrl to start recording"
+    echo "2. Double-tap and hold Ctrl to start transcribing"
     echo "3. Say: 'Hello world period'"
-    echo "4. Double-tap Ctrl to stop"
+    echo "4. Release Ctrl to inject the text"
     echo "5. You should see: 'Hello world.'"
     echo ""
     echo "💡 Voice commands: 'period' 'comma' 'new line' 'delete that'"

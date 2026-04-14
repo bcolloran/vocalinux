@@ -214,6 +214,11 @@ class PynputKeyboardBackend(KeyboardBackend):
     def _on_press(self, key) -> None:
         """Handle key press events."""
         try:
+            if key == getattr(keyboard.Key, "esc", None) and self.escape_callback is not None:
+                logger.debug("Escape key detected (pynput)")
+                threading.Thread(target=self.escape_callback, daemon=True).start()
+                return
+
             matched = self._matches_configured_modifier(key)
 
             if matched:

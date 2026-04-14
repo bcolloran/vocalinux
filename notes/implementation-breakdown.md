@@ -1,164 +1,162 @@
-# Implementation Breakdown (MVP: Preview + Deferred Injection)
+# Implementation Breakdown (Updated After MVP)
 
-This plan breaks MVP delivery into ordered tasks with acceptance criteria and test strategy.
+This note tracks the original MVP task list against what has now shipped.
 
-## Task 0 — Baseline mapping and feature flag
+## Status Summary
 
-### Deliverables
-- Add an explicit mode/flag for transcript behavior:
-  - `immediate_injection` (current behavior)
-  - `preview_deferred_injection` (MVP)
-- Ensure startup wiring reads this mode from config/settings.
+- Task 0: complete
+- Task 1: complete
+- Task 2: complete for MVP
+- Task 3: complete for MVP
+- Task 4: partially complete
 
-### Acceptance criteria
-- Default mode preserves current production behavior.
-- Preview mode can be enabled without breaking start/stop recognition.
+The preview-first MVP is now functional enough to treat as the current shipped
+baseline, with follow-up work focused on polish, robustness, and ergonomics.
 
-### Test strategy
-- Unit test config parsing + mode selection.
-- Smoke test start/stop in both modes (mocked recognition + injector).
+## Task 0 — Baseline Mapping And Feature Flag
 
----
+### Delivered
 
-## Task 1 — Pending transcript store + events
+- transcript behavior now has explicit modes:
+  - `immediate_injection`
+  - `preview_deferred_injection`
+- config/settings wiring exists for transcript output mode
+- legacy values are normalized on load
 
-### Deliverables
-- Introduce a pending transcript accumulator component (thread-safe API).
-- Replace direct callback->inject path in preview mode:
-  - recognition callback appends to pending store,
-  - emits update notifications for UI.
+### Notes
 
-### Acceptance criteria
-- In preview mode, dictated text is accumulated but not injected.
-- Segment spacing behavior is deterministic and documented.
-- Pending buffer can be cleared atomically.
+- HTT behavior is now slightly more opinionated than the original plan:
+  when the preview window/controller are present, HTT uses the live-preview
+  release flow even if the saved output mode is immediate
 
-### Test strategy
-- Unit tests for append/merge/clear semantics.
-- Concurrency tests for callback-thread append + UI-thread read.
+### Status
+
+- complete
 
 ---
 
-## Task 2 — Preview UI surface and actions
+## Task 1 — Pending Transcript Store + Events
 
-### Deliverables
-- Add minimal preview surface (tray dialog/popover/window) to show pending transcript.
-- Add controls:
-  - Commit (inject now)
-  - Discard (clear pending)
-  - Optional Copy (nice-to-have for MVP if trivial)
+### Delivered
 
-### Acceptance criteria
-- User can inspect pending text before injection.
-- Commit performs one injection transaction for full pending text.
-- Discard leaves focused app unchanged.
+- `PendingTranscriptStore` now owns buffered transcript accumulation
+- `TranscriptOutputController` mediates finalized text handling
+- pending-text listeners update UI when buffered text changes
+- spacing behavior is normalized through the controller
 
-### Test strategy
-- UI logic tests around action handlers (can be presenter/controller-level).
-- Integration-style test with mock injector validating commit/discard outcomes.
+### Status
+
+- complete
 
 ---
 
-## Task 3 — Commit pipeline + state integration
+## Task 2 — Preview UI Surface And Actions
 
-### Deliverables
-- Implement deferred commit path to `TextInjector.inject_text`.
-- Define behavior on recognition state change:
-  - e.g., on transition to `IDLE`, keep or clear pending text according to policy.
-- Ensure command actions remain correct (or gated) in preview mode.
+### Delivered
 
-### Acceptance criteria
-- Commit injects exactly pending transcript and then clears it.
-- No accidental auto-injection on stop unless explicitly configured.
-- Action callbacks do not corrupt pending text state.
+- standalone GTK preview window exists
+- actions implemented:
+  - `Commit`
+  - `Discard`
+  - `Copy`
+- tray can open/focus the preview window
+- preview settings now include:
+  - horizontal placement
+  - vertical placement
 
-### Test strategy
-- Unit tests for state-transition policy.
-- Integration tests for sequence:
-  - start → dictate segments → stop → commit
-  - start → dictate → discard
-  - push-to-talk and toggle mode variants.
+### MVP deviation from original plan
+
+- the preview UI shipped as a standalone utility window instead of a
+  tray-attached popover
+- this turned out to be the simpler and more reliable MVP path
+
+### Status
+
+- complete for MVP
 
 ---
 
-## Task 4 — Hardening, regressions, and docs
+## Task 3 — Commit Pipeline + State Integration
 
-### Deliverables
-- Validate legacy immediate mode remains intact.
-- Add/refresh developer docs for data flow and mode behavior.
-- Add telemetry/logging breadcrumbs for pending/commit/discard lifecycle.
+### Delivered
 
-### Acceptance criteria
-- Existing command and injection behavior unchanged in immediate mode.
-- Preview mode verified with both `whisper_cpp` and at least one alternate engine.
-- Documentation updated and discoverable.
+- pending transcript commit injects once and clears on success
+- discard clears pending transcript without injection
+- preview mode does not auto-inject on stop
+- HTT release now commits live preview text directly
+- HTT `Esc` cancellation closes the preview path and suppresses trailing
+  finalized callbacks until `IDLE`
+- duplicate injection path caused by synthetic post-typing `Escape` has been removed
 
-### Test strategy
-- Regression suite across both modes.
-- Manual matrix test on X11 + Wayland if available.
-- Negative-path tests for injector failure on commit.
+### Notes
 
-## Mermaid: Current Threading and Callback Flow
+- command actions still run immediately through the existing action path
+- dictated text and command actions now have meaningfully different output paths,
+  which is acceptable for MVP but should stay documented
 
-```mermaid
-flowchart LR
-  subgraph T1[Audio Thread]
-    RA[_record_audio]
-    ENQ[_enqueue_audio_segment]
-  end
+### Status
 
-  subgraph T2[Recognition Thread]
-    PR[_perform_recognition]
-    PB[_process_audio_buffer]
-    TXT[text_callbacks]
-    ACT[action_callbacks]
-  end
+- complete for MVP
 
-  subgraph T0[Main/GTK Thread]
-    MW[text_callback_wrapper]
-    AH[ActionHandler]
-    INJ[TextInjector.inject_text]
-  end
+---
 
-  RA --> ENQ --> PR --> PB
-  PB --> TXT --> MW --> INJ
-  PB --> ACT --> AH --> INJ
-```
+## Task 4 — Hardening, Regressions, And Docs
 
-## Mermaid: Planned MVP Flow (Preview + Deferred Injection)
+### Delivered
 
-```mermaid
-flowchart LR
-  subgraph T1[Audio Thread]
-    RA[_record_audio]
-    ENQ[_enqueue_audio_segment]
-  end
+- additional lifecycle logging around:
+  - pending transcript changes
+  - HTT preview session start/commit/cancel
+  - preview window presentation
+  - sound playback requests
+  - xdotool typing settings
+- tests now cover:
+  - output-mode normalization
+  - pending transcript behavior
+  - HTT suppression behavior
+  - preview/settings config
+  - text injector delay behavior
 
-  subgraph T2[Recognition Thread]
-    PR[_perform_recognition]
-    PB[_process_audio_buffer]
-    TXT[text_callbacks]
-    ACT[action_callbacks]
-  end
+### Still Outstanding
 
-  subgraph T0[Main/GTK Thread]
-    PS[PendingTranscriptStore]
-    PV[Preview UI]
-    COMMIT[Commit action]
-    DISCARD[Discard action]
-    INJ[TextInjector.inject_text]
-    AH[ActionHandler]
-  end
+- broader manual verification across desktop/session combinations
+- more explicit documentation of HTT-vs-toggle behavior in end-user docs
+- better install-time persistence UX around reuse of prior install choices
+- deeper negative-path testing for injector failure / focus drift in real desktops
 
-  RA --> ENQ --> PR --> PB --> TXT --> PS --> PV
-  PV --> COMMIT --> INJ
-  PV --> DISCARD --> PS
-  PB --> ACT --> AH
-```
+### Status
 
-## End-to-End MVP Acceptance (Cross-task)
+- partially complete
 
-- Dictation in preview mode never injects automatically.
-- Commit/discard are explicit and deterministic.
-- Legacy immediate mode behavior remains unchanged.
-- No thread-safety regressions under rapid start/stop and multi-segment dictation.
+---
+
+## Current Acceptance Snapshot
+
+### Working
+
+- immediate mode still injects directly
+- preview mode buffers finalized text for explicit review
+- preview window can commit/discard/copy pending transcript
+- HTT opens preview immediately
+- HTT release injects live preview text
+- HTT `Esc` cancels the session
+- preview placement is configurable
+- xdotool typing delay is configurable
+
+### Known Limitations
+
+- injection is still simulated typing for xdotool targets
+- preview window is not yet tray-attached
+- HTT live preview text is still dependent on recognition cadence and may lag on
+  very quick releases
+- install-config reuse needed extra hardening for older installs / missing
+  metadata files
+
+## Recommended Next Work
+
+1. Harden installer reuse flow and document where installer metadata lives.
+2. Add manual QA coverage for HTT on X11, XWayland, and Wayland/IBus paths.
+3. Consider a faster non-typing injection path where platform/tooling allows it.
+4. Decide whether HTT should remain preview-window-driven regardless of saved
+   transcript output mode, or become explicitly configurable.
+5. Improve preview UX with optional tray anchoring, sizing, and maybe inline edit support.

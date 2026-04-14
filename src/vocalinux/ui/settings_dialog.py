@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 import gi
 
@@ -28,6 +28,13 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from ..common_types import RecognitionState  # noqa: E402
+from ..transcript_output import (
+    OUTPUT_MODE_DEFAULT,
+    OUTPUT_MODE_IMMEDIATE,
+    OUTPUT_MODE_PREVIEW,
+    normalize_output_mode,
+)
+from .preview_window import PREVIEW_HORIZONTAL_OPTIONS, PREVIEW_VERTICAL_OPTIONS
 from ..utils.vosk_model_info import SUPPORTED_LANGUAGES, VOSK_MODEL_INFO  # noqa: E402
 from ..utils.whispercpp_model_info import (
     WHISPERCPP_MODEL_INFO,
@@ -42,6 +49,7 @@ from .keyboard_backends import (  # noqa: E402
     SHORTCUT_MODES,
     SUPPORTED_SHORTCUTS,
 )
+from .audio_feedback import get_sound_diagnostics, play_start_sound, play_stop_sound
 
 # Avoid circular imports for type checking
 if TYPE_CHECKING:
@@ -83,9 +91,75 @@ WHISPER_MODEL_INFO = {
 }
 
 OUTPUT_MODES = {
-    "immediate": "Immediate (inject each finalized segment)",
-    "deferred_until_release": "Deferred until release (inject once on stop)",
+    OUTPUT_MODE_IMMEDIATE: "Immediate (inject each finalized segment)",
+    OUTPUT_MODE_PREVIEW: "Preview before commit (review, then commit or discard)",
 }
+
+DEFAULT_PREVIEW_HORIZONTAL_PLACEMENT = "left"
+DEFAULT_PREVIEW_VERTICAL_PLACEMENT = "top"
+
+
+def _run_download_and_apply(
+    *,
+    speech_engine,
+    settings: dict,
+    engine: str,
+    model_name: str,
+    download_dialog,
+    progress_callback: Callable[[float, float, str], None],
+    apply_settings_callback: Callable[..., bool],
+    success_callback: Optional[Callable[[], None]] = None,
+    whisper_install_callback: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Run a download/apply cycle and update the progress dialog once."""
+    try:
+        speech_engine.set_download_progress_callback(progress_callback)
+
+        def check_cancelled():
+            if download_dialog.cancelled:
+                speech_engine.cancel_download()
+            return not download_dialog.cancelled
+
+        cancel_check_id = GLib.timeout_add(100, check_cancelled)
+
+        try:
+            logger.info("Starting model download/apply. engine=%s model=%s", engine, model_name)
+            apply_settings_callback(
+                settings,
+                raise_on_error=True,
+                show_error_dialog=False,
+            )
+            logger.info(
+                "Model download/apply completed successfully. engine=%s model=%s",
+                engine,
+                model_name,
+            )
+            GLib.idle_add(download_dialog.set_complete, True, "")
+            if success_callback is not None:
+                GLib.idle_add(success_callback)
+            return True
+        finally:
+            GLib.source_remove(cancel_check_id)
+            speech_engine.set_download_progress_callback(None)
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(
+            "Model download/apply failed. engine=%s model=%s error=%s",
+            engine,
+            model_name,
+            error_msg,
+            exc_info=True,
+        )
+        if "cancelled" in error_msg.lower():
+            GLib.idle_add(download_dialog.set_complete, False, "Download cancelled")
+        elif engine == "whisper" and "no module named" in error_msg.lower():
+            GLib.idle_add(download_dialog.set_complete, False, "Whisper not installed")
+            if whisper_install_callback is not None:
+                GLib.idle_add(whisper_install_callback)
+        else:
+            GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+        return False
 
 
 def get_available_engines():
@@ -729,6 +803,7 @@ class SettingsDialog(Gtk.Dialog):
         config_manager: "ConfigManager",
         speech_engine: "SpeechRecognitionManager",
         shortcut_update_callback: callable = None,
+        output_mode_changed_callback: Optional[Callable[[str], None]] = None,
     ):
         super().__init__(title="Vocalinux Settings", transient_for=parent, flags=0)
         self.set_decorated(True)  # Force window decorations (close button) on all WMs
@@ -740,6 +815,7 @@ class SettingsDialog(Gtk.Dialog):
         self.config_manager = config_manager
         self.speech_engine = speech_engine
         self.shortcut_update_callback = shortcut_update_callback
+        self.output_mode_changed_callback = output_mode_changed_callback
         self._test_active = False
         self._test_result = ""
         self._initializing = True  # Flag to prevent auto-apply during initialization
@@ -808,6 +884,12 @@ class SettingsDialog(Gtk.Dialog):
         self.shortcuts_tab.set_margin_start(16)
         self.shortcuts_tab.set_margin_end(16)
 
+        self.preview_tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.preview_tab.set_margin_top(16)
+        self.preview_tab.set_margin_bottom(16)
+        self.preview_tab.set_margin_start(16)
+        self.preview_tab.set_margin_end(16)
+
         self.general_tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.general_tab.set_margin_top(16)
         self.general_tab.set_margin_bottom(16)
@@ -835,6 +917,10 @@ class SettingsDialog(Gtk.Dialog):
         shortcuts_label.set_tooltip_text("Keyboard shortcuts")
         notebook.append_page(self.shortcuts_tab, shortcuts_label)
 
+        preview_label = Gtk.Label(label="Preview")
+        preview_label.set_tooltip_text("Preview window placement")
+        notebook.append_page(self.preview_tab, preview_label)
+
         # General tab - least important (application behavior)
         general_label = Gtk.Label(label="General")
         general_label.set_tooltip_text("General settings")
@@ -851,6 +937,7 @@ class SettingsDialog(Gtk.Dialog):
         self._build_engine_section()
         self._build_recognition_section()
         self._build_shortcuts_section()
+        self._build_preview_section()
         self._build_test_section()
 
         # Load settings and populate UI
@@ -940,6 +1027,18 @@ class SettingsDialog(Gtk.Dialog):
             widget=self.sound_effects_switch,
         )
         sound_group.add_row(sound_row)
+
+        self.test_sound_btn = Gtk.Button(label="Test Sounds")
+        self.test_sound_btn.set_tooltip_text(
+            "Play the same start and stop alerts Vocalinux uses while recording"
+        )
+        self.test_sound_btn.connect("clicked", self._on_test_sounds_clicked)
+        sound_test_row = PreferenceRow(
+            title="Sound Test",
+            subtitle="Play start/stop alerts and log player diagnostics",
+            widget=self.test_sound_btn,
+        )
+        sound_group.add_row(sound_test_row)
         self.audio_tab.pack_start(sound_group, False, False, 0)
         self.sound_effects_switch.connect("state-set", self._on_sound_effects_toggled)
 
@@ -981,11 +1080,27 @@ class SettingsDialog(Gtk.Dialog):
         )
         group.add_row(copy_to_clipboard_row)
 
+        self.text_injection_delay_spin = Gtk.SpinButton.new_with_range(0, 100, 1)
+        self.text_injection_delay_spin.set_digits(0)
+        self.text_injection_delay_spin.set_tooltip_text(
+            "Per-character delay for xdotool typing on X11/XWayland. Lower is faster."
+        )
+        _prevent_scroll_on_hover(self.text_injection_delay_spin)
+        text_injection_delay_row = PreferenceRow(
+            title="Text Injection Delay",
+            subtitle="xdotool typing delay in milliseconds per character",
+            widget=self.text_injection_delay_spin,
+        )
+        group.add_row(text_injection_delay_row)
+
         self.general_tab.pack_start(group, False, False, 0)
 
         self.autostart_switch.connect("state-set", self._on_autostart_toggled)
         self.start_minimized_switch.connect("state-set", self._on_start_minimized_toggled)
         self.copy_to_clipboard_switch.connect("state-set", self._on_copy_to_clipboard_toggled)
+        self.text_injection_delay_spin.connect(
+            "value-changed", self._on_text_injection_delay_changed
+        )
 
     def _on_autostart_toggled(self, widget, state):
         """Handle toggle of the autostart switch."""
@@ -1029,6 +1144,83 @@ class SettingsDialog(Gtk.Dialog):
         logger.info(f"Copy to clipboard {'enabled' if enabled else 'disabled'}")
         return False
 
+    def _on_text_injection_delay_changed(self, widget):
+        """Handle changes to xdotool typing delay."""
+        if self._initializing or self._applying_settings:
+            return
+
+        delay_ms = int(self.text_injection_delay_spin.get_value())
+        logger.info("Text injection delay changed: %sms", delay_ms)
+        self.config_manager.set("text_injection", "typing_delay_ms", delay_ms)
+        self.config_manager.save_settings()
+
+    def _build_preview_section(self):
+        """Build the preview window settings section."""
+        group = PreferencesGroup(
+            title="Preview Window",
+            description="Control where the HTT preview window appears on screen",
+        )
+
+        self.preview_horizontal_combo = Gtk.ComboBoxText()
+        self.preview_horizontal_combo.set_size_request(180, -1)
+        self.preview_horizontal_combo.set_tooltip_text(
+            "Choose whether the preview window opens on the left, center, or right."
+        )
+        _prevent_scroll_on_hover(self.preview_horizontal_combo)
+        for placement_id, label in PREVIEW_HORIZONTAL_OPTIONS.items():
+            self.preview_horizontal_combo.append(placement_id, label)
+        horizontal_row = PreferenceRow(
+            title="Horizontal Placement",
+            subtitle="Left, center, or right side of the screen",
+            widget=self.preview_horizontal_combo,
+        )
+        group.add_row(horizontal_row)
+
+        self.preview_vertical_combo = Gtk.ComboBoxText()
+        self.preview_vertical_combo.set_size_request(180, -1)
+        self.preview_vertical_combo.set_tooltip_text(
+            "Choose whether the preview window opens near the top, middle, or bottom."
+        )
+        _prevent_scroll_on_hover(self.preview_vertical_combo)
+        for placement_id, label in PREVIEW_VERTICAL_OPTIONS.items():
+            self.preview_vertical_combo.append(placement_id, label)
+        vertical_row = PreferenceRow(
+            title="Vertical Placement",
+            subtitle="Top, middle, or bottom of the screen",
+            widget=self.preview_vertical_combo,
+        )
+        group.add_row(vertical_row)
+
+        self.preview_tab.pack_start(group, False, False, 0)
+        self.preview_horizontal_combo.connect("changed", self._on_preview_horizontal_changed)
+        self.preview_vertical_combo.connect("changed", self._on_preview_vertical_changed)
+
+    def _on_preview_horizontal_changed(self, widget):
+        """Handle preview window horizontal placement changes."""
+        if self._initializing or self._applying_settings:
+            return
+
+        placement = (self.preview_horizontal_combo.get_active_id() or "").lower()
+        if placement not in PREVIEW_HORIZONTAL_OPTIONS:
+            placement = DEFAULT_PREVIEW_HORIZONTAL_PLACEMENT
+
+        logger.info("Preview window horizontal placement changed: %s", placement)
+        self.config_manager.set("preview_window", "horizontal_placement", placement)
+        self.config_manager.save_settings()
+
+    def _on_preview_vertical_changed(self, widget):
+        """Handle preview window vertical placement changes."""
+        if self._initializing or self._applying_settings:
+            return
+
+        placement = (self.preview_vertical_combo.get_active_id() or "").lower()
+        if placement not in PREVIEW_VERTICAL_OPTIONS:
+            placement = DEFAULT_PREVIEW_VERTICAL_PLACEMENT
+
+        logger.info("Preview window vertical placement changed: %s", placement)
+        self.config_manager.set("preview_window", "vertical_placement", placement)
+        self.config_manager.save_settings()
+
     def _on_sound_effects_toggled(self, widget, state):
         if self._initializing or self._applying_settings:
             return False
@@ -1039,6 +1231,23 @@ class SettingsDialog(Gtk.Dialog):
         self.config_manager.save_settings()
         logger.info(f"Sound effects {'enabled' if enabled else 'disabled'}")
         return False
+
+    def _on_test_sounds_clicked(self, widget):
+        """Play start and stop alerts while logging diagnostics."""
+
+        def run_sound_test() -> None:
+            diagnostics = get_sound_diagnostics()
+            logger.info("Running sound test with diagnostics: %s", diagnostics)
+            start_success = play_start_sound()
+            time.sleep(0.35)
+            stop_success = play_stop_sound()
+            logger.info(
+                "Sound test completed. start_success=%s stop_success=%s",
+                start_success,
+                stop_success,
+            )
+
+        threading.Thread(target=run_sound_test, daemon=True).start()
 
     def _build_engine_section(self):
         """Build the Speech Engine section."""
@@ -1135,7 +1344,7 @@ class SettingsDialog(Gtk.Dialog):
         self.output_mode_combo = Gtk.ComboBoxText()
         self.output_mode_combo.set_size_request(320, -1)
         self.output_mode_combo.set_tooltip_text(
-            "Choose whether text is injected as segments finalize or once when recording stops."
+            "Choose whether text is typed immediately or held for explicit review and commit."
         )
         _prevent_scroll_on_hover(self.output_mode_combo)
         for mode, description in OUTPUT_MODES.items():
@@ -1143,7 +1352,7 @@ class SettingsDialog(Gtk.Dialog):
 
         output_mode_row = PreferenceRow(
             title="Output Mode",
-            subtitle="Immediate typing or deferred commit on release/stop",
+            subtitle="Immediate typing or preview-first review before commit",
             widget=self.output_mode_combo,
         )
         group.add_row(output_mode_row)
@@ -1212,9 +1421,9 @@ class SettingsDialog(Gtk.Dialog):
             self.shortcut_mode_combo.append(mode_id, display_name)
 
         # Load current mode from config
-        current_mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
+        current_mode = self.config_manager.get_str("shortcuts", "mode", "push_to_talk")
         if not self.shortcut_mode_combo.set_active_id(current_mode):
-            self.shortcut_mode_combo.set_active_id("toggle")
+            self.shortcut_mode_combo.set_active_id("push_to_talk")
 
         mode_row = PreferenceRow(
             title="Shortcut Mode",
@@ -1510,7 +1719,7 @@ class SettingsDialog(Gtk.Dialog):
         self.current_engine = settings["engine"]
         self.language = settings["language"]
         self.current_model_size = settings["model_size"]
-        self.current_output_mode = settings.get("output_mode", "deferred_until_release")
+        self.current_output_mode = normalize_output_mode(settings.get("output_mode"))
         self.current_vad = settings.get("vad_sensitivity", 3)
         self.current_silence = settings.get("silence_timeout", 2.0)
 
@@ -1520,16 +1729,34 @@ class SettingsDialog(Gtk.Dialog):
 
         general_settings = self.config_manager.get_settings().get("general", {})
         ui_settings = self.config_manager.get_settings().get("ui", {})
+        preview_settings = self.config_manager.get_settings().get("preview_window", {})
         text_injection_settings = self.config_manager.get_settings().get("text_injection", {})
 
         autostart_enabled = general_settings.get("autostart", False)
         start_minimized = ui_settings.get("start_minimized", False)
         copy_to_clipboard = text_injection_settings.get("copy_to_clipboard", False)
+        text_injection_delay_ms = text_injection_settings.get("typing_delay_ms", 0)
+        preview_horizontal_placement = (
+            preview_settings.get("horizontal_placement", DEFAULT_PREVIEW_HORIZONTAL_PLACEMENT)
+            .lower()
+        )
+        preview_vertical_placement = (
+            preview_settings.get("vertical_placement", DEFAULT_PREVIEW_VERTICAL_PLACEMENT).lower()
+        )
 
         self.autostart_switch.set_active(autostart_enabled)
         self.start_minimized_switch.set_active(start_minimized)
         self.copy_to_clipboard_switch.set_active(copy_to_clipboard)
+        self.text_injection_delay_spin.set_value(int(text_injection_delay_ms))
         self.sound_effects_switch.set_active(self.config_manager.is_sound_effects_enabled())
+        if preview_horizontal_placement not in PREVIEW_HORIZONTAL_OPTIONS:
+            preview_horizontal_placement = DEFAULT_PREVIEW_HORIZONTAL_PLACEMENT
+        if preview_vertical_placement not in PREVIEW_VERTICAL_OPTIONS:
+            preview_vertical_placement = DEFAULT_PREVIEW_VERTICAL_PLACEMENT
+        if not self.preview_horizontal_combo.set_active_id(preview_horizontal_placement):
+            self.preview_horizontal_combo.set_active_id(DEFAULT_PREVIEW_HORIZONTAL_PLACEMENT)
+        if not self.preview_vertical_combo.set_active_id(preview_vertical_placement):
+            self.preview_vertical_combo.set_active_id(DEFAULT_PREVIEW_VERTICAL_PLACEMENT)
 
         # Populate engine combo with only available engines
         available_engines = get_available_engines()
@@ -1589,7 +1816,7 @@ class SettingsDialog(Gtk.Dialog):
 
         # Set spin button values
         if not self.output_mode_combo.set_active_id(self.current_output_mode):
-            self.output_mode_combo.set_active_id("deferred_until_release")
+            self.output_mode_combo.set_active_id(OUTPUT_MODE_DEFAULT)
         self.vad_spin.set_value(self.current_vad)
         self.silence_spin.set_value(self.current_silence)
 
@@ -1608,7 +1835,7 @@ class SettingsDialog(Gtk.Dialog):
         model_size = self.config_manager.get_model_size_for_engine(engine)
         vad_sensitivity = sr_settings.get("vad_sensitivity", 3)
         silence_timeout = sr_settings.get("silence_timeout", 2.0)
-        output_mode = sr_settings.get("output_mode", "deferred_until_release")
+        output_mode = normalize_output_mode(sr_settings.get("output_mode"))
 
         logger.info(
             f"Loaded current settings: engine={engine}, language={language}, model_size={model_size}, "
@@ -1757,6 +1984,15 @@ class SettingsDialog(Gtk.Dialog):
 
     def _on_output_mode_changed(self, widget):
         """Handle output mode selection changes."""
+        if self._initializing or self._applying_settings:
+            return
+        output_mode = normalize_output_mode(self.output_mode_combo.get_active_id())
+        logger.info("Output mode changed in settings dialog: %s", output_mode)
+        if self.output_mode_changed_callback is not None:
+            try:
+                self.output_mode_changed_callback(output_mode)
+            except Exception as e:
+                logger.warning(f"Failed to apply output mode callback immediately: {e}")
         self._auto_apply_settings()
 
     def _on_voice_commands_toggled(self, widget, state):
@@ -1955,41 +2191,17 @@ class SettingsDialog(Gtk.Dialog):
                     GLib.idle_add(download_dialog.update_progress, fraction, speed, status)
 
                 def download_and_apply():
-                    try:
-                        self.speech_engine.set_download_progress_callback(progress_callback)
-
-                        def check_cancelled():
-                            if download_dialog.cancelled:
-                                self.speech_engine.cancel_download()
-                            return not download_dialog.cancelled
-
-                        cancel_check_id = GLib.timeout_add(100, check_cancelled)
-
-                        try:
-                            self._apply_settings_internal(settings)
-                            GLib.idle_add(download_dialog.set_complete, True, "")
-                            GLib.idle_add(self._populate_model_options)
-                        finally:
-                            GLib.source_remove(cancel_check_id)
-                            self.speech_engine.set_download_progress_callback(None)
-
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "cancelled" in error_msg.lower():
-                            GLib.idle_add(
-                                download_dialog.set_complete,
-                                False,
-                                "Download cancelled",
-                            )
-                        elif engine == "whisper" and "no module named" in error_msg.lower():
-                            GLib.idle_add(
-                                download_dialog.set_complete,
-                                False,
-                                "Whisper not installed",
-                            )
-                            GLib.idle_add(self._show_whisper_install_dialog)
-                        else:
-                            GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+                    _run_download_and_apply(
+                        speech_engine=self.speech_engine,
+                        settings=settings,
+                        engine=engine,
+                        model_name=model_name,
+                        download_dialog=download_dialog,
+                        progress_callback=progress_callback,
+                        apply_settings_callback=self._apply_settings_internal,
+                        success_callback=self._populate_model_options,
+                        whisper_install_callback=self._show_whisper_install_dialog,
+                    )
 
                 threading.Thread(target=download_and_apply, daemon=True).start()
                 download_dialog.run()
@@ -2026,7 +2238,7 @@ class SettingsDialog(Gtk.Dialog):
 
         vad = int(self.vad_spin.get_value())
         silence = self.silence_spin.get_value()
-        output_mode = self.output_mode_combo.get_active_id() or "deferred_until_release"
+        output_mode = normalize_output_mode(self.output_mode_combo.get_active_id())
 
         return {
             "engine": engine,
@@ -2186,6 +2398,9 @@ For now, the engine has been reverted to VOSK."""
         if engine == "whisper" and not _is_whisper_model_downloaded(model_name):
             needs_download = True
             model_info = WHISPER_MODEL_INFO.get(model_name, {"size_mb": 500})
+        elif engine == "whisper_cpp" and not is_whispercpp_model_downloaded(model_name):
+            needs_download = True
+            model_info = WHISPERCPP_MODEL_INFO.get(model_name, {"size_mb": 39})
         elif engine == "vosk" and not _is_vosk_model_downloaded(model_name, self.language):
             needs_download = True
             model_info = VOSK_MODEL_INFO.get(model_name, {"size_mb": 50})
@@ -2198,48 +2413,39 @@ For now, the engine has been reverted to VOSK."""
                 engine=engine,
                 language=self.language,
             )
+            download_result = {"success": False}
 
             def progress_callback(fraction, speed, status):
                 GLib.idle_add(download_dialog.update_progress, fraction, speed, status)
 
             def download_and_apply():
-                try:
-                    self.speech_engine.set_download_progress_callback(progress_callback)
-
-                    def check_cancelled():
-                        if download_dialog.cancelled:
-                            self.speech_engine.cancel_download()
-                        return not download_dialog.cancelled
-
-                    cancel_check_id = GLib.timeout_add(100, check_cancelled)
-
-                    try:
-                        self._apply_settings_internal(settings)
-                        GLib.idle_add(download_dialog.set_complete, True, "")
-                    finally:
-                        GLib.source_remove(cancel_check_id)
-                        self.speech_engine.set_download_progress_callback(None)
-
-                except Exception as e:
-                    error_msg = str(e)
-                    if "cancelled" in error_msg.lower():
-                        GLib.idle_add(download_dialog.set_complete, False, "Download cancelled")
-                    elif engine == "whisper" and "no module named" in error_msg.lower():
-                        GLib.idle_add(download_dialog.set_complete, False, "Whisper not installed")
-                        GLib.idle_add(self._show_whisper_install_dialog)
-                    else:
-                        GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+                download_result["success"] = _run_download_and_apply(
+                    speech_engine=self.speech_engine,
+                    settings=settings,
+                    engine=engine,
+                    model_name=model_name,
+                    download_dialog=download_dialog,
+                    progress_callback=progress_callback,
+                    apply_settings_callback=self._apply_settings_internal,
+                    whisper_install_callback=self._show_whisper_install_dialog,
+                )
 
             threading.Thread(target=download_and_apply, daemon=True).start()
             download_dialog.run()
             download_dialog.destroy()
 
             self._populate_model_options()
-            return True
+            return download_result["success"]
 
         return self._apply_settings_internal(settings)
 
-    def _apply_settings_internal(self, settings: dict) -> bool:
+    def _apply_settings_internal(
+        self,
+        settings: dict,
+        *,
+        raise_on_error: bool = False,
+        show_error_dialog: bool = True,
+    ) -> bool:
         """Internal method to apply settings."""
         try:
             self.config_manager.update_speech_recognition_settings(settings)
@@ -2256,6 +2462,12 @@ For now, the engine has been reverted to VOSK."""
             return True
         except Exception as e:
             logger.error(f"Failed to apply settings: {e}", exc_info=True)
+
+            if raise_on_error:
+                raise
+
+            if not show_error_dialog:
+                return False
 
             if "whisper" in str(e).lower() and "no module named" in str(e).lower():
                 self._show_whisper_install_dialog()

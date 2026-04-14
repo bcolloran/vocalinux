@@ -3,9 +3,10 @@ Tests for the main module functionality.
 """
 
 import argparse
+import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 # Mock GTK modules before importing vocalinux.main
 sys.modules["gi"] = MagicMock()
@@ -161,6 +162,7 @@ class TestMainModule(unittest.TestCase):
     @patch("vocalinux.speech_recognition.recognition_manager.SpeechRecognitionManager")
     @patch("vocalinux.text_injection.text_injector.TextInjector")
     @patch("vocalinux.ui.tray_indicator.TrayIndicator")
+    @patch("vocalinux.ui.preview_window.PreviewWindow")
     @patch("vocalinux.main.logging")
     @patch("vocalinux.ui.config_manager.ConfigManager")
     @patch("vocalinux.ui.logging_manager.initialize_logging")
@@ -169,6 +171,7 @@ class TestMainModule(unittest.TestCase):
         mock_init_logging,
         mock_config_manager,
         mock_logging,
+        mock_preview_window,
         mock_tray,
         mock_text,
         mock_speech,
@@ -192,12 +195,14 @@ class TestMainModule(unittest.TestCase):
         mock_text_instance = MagicMock()
         mock_tray_instance = MagicMock()
         mock_action_instance = MagicMock()
+        mock_preview_window_instance = MagicMock()
 
         # Setup return values
         mock_speech.return_value = mock_speech_instance
         mock_text.return_value = mock_text_instance
         mock_tray.return_value = mock_tray_instance
         mock_action_handler.return_value = mock_action_instance
+        mock_preview_window.return_value = mock_preview_window_instance
 
         # Mock the arguments
         with patch("vocalinux.main.parse_arguments") as mock_parse:
@@ -225,7 +230,10 @@ class TestMainModule(unittest.TestCase):
             mock_text.assert_called_once_with(wayland_mode=True)
             mock_action_handler.assert_called_once_with(mock_text_instance)
             mock_tray.assert_called_once_with(
-                speech_engine=mock_speech_instance, text_injector=mock_text_instance
+                speech_engine=mock_speech_instance,
+                text_injector=mock_text_instance,
+                output_controller=ANY,
+                preview_window=mock_preview_window_instance,
             )
 
             # Verify callbacks were registered
@@ -243,6 +251,7 @@ class TestMainModule(unittest.TestCase):
     @patch("vocalinux.speech_recognition.recognition_manager.SpeechRecognitionManager")
     @patch("vocalinux.text_injection.text_injector.TextInjector")
     @patch("vocalinux.ui.tray_indicator.TrayIndicator")
+    @patch("vocalinux.ui.preview_window.PreviewWindow")
     @patch("vocalinux.main.logging")
     @patch("vocalinux.ui.config_manager.ConfigManager")
     @patch("vocalinux.ui.logging_manager.initialize_logging")
@@ -251,6 +260,7 @@ class TestMainModule(unittest.TestCase):
         mock_init_logging,
         mock_config_manager,
         mock_logging,
+        mock_preview_window,
         mock_tray,
         mock_text,
         mock_speech,
@@ -363,12 +373,14 @@ class TestMainModule(unittest.TestCase):
     @patch("vocalinux.text_injection.text_injector.TextInjector")
     @patch("vocalinux.ui.tray_indicator.TrayIndicator")
     @patch("vocalinux.ui.first_run_dialog.show_first_run_dialog")
+    @patch("vocalinux.ui.preview_window.PreviewWindow")
     @patch("vocalinux.ui.config_manager.ConfigManager")
     @patch("vocalinux.ui.logging_manager.initialize_logging")
     def test_main_start_minimized_skips_first_run_prompt(
         self,
         mock_init_logging,
         mock_config_manager,
+        mock_preview_window,
         mock_first_run_dialog,
         mock_tray,
         mock_text,
@@ -530,12 +542,14 @@ class TestMainConfigPrecedence(unittest.TestCase):
     @patch("vocalinux.speech_recognition.recognition_manager.SpeechRecognitionManager")
     @patch("vocalinux.text_injection.text_injector.TextInjector")
     @patch("vocalinux.ui.tray_indicator.TrayIndicator")
+    @patch("vocalinux.ui.preview_window.PreviewWindow")
     @patch("vocalinux.ui.config_manager.ConfigManager")
     @patch("vocalinux.ui.logging_manager.initialize_logging")
     def test_cli_args_override_config(
         self,
         mock_init_logging,
         mock_config_manager,
+        mock_preview_window,
         mock_tray,
         mock_text,
         mock_speech,
@@ -595,12 +609,14 @@ class TestMainConfigPrecedence(unittest.TestCase):
     @patch("vocalinux.speech_recognition.recognition_manager.SpeechRecognitionManager")
     @patch("vocalinux.text_injection.text_injector.TextInjector")
     @patch("vocalinux.ui.tray_indicator.TrayIndicator")
+    @patch("vocalinux.ui.preview_window.PreviewWindow")
     @patch("vocalinux.ui.config_manager.ConfigManager")
     @patch("vocalinux.ui.logging_manager.initialize_logging")
     def test_config_used_when_no_cli_args(
         self,
         mock_init_logging,
         mock_config_manager,
+        mock_preview_window,
         mock_tray,
         mock_text,
         mock_speech,
@@ -650,126 +666,92 @@ class TestMainConfigPrecedence(unittest.TestCase):
 
 
 class TestTextOutputModes(unittest.TestCase):
-    """Test immediate/deferred output handling for finalized text segments."""
+    """Test transcript output controller behavior used by main.py."""
 
-    def _make_callbacks(self, output_mode: str = "immediate"):
-        """Build callbacks equivalent to main.py wiring with mocked dependencies."""
+    def _make_controller(self, output_mode: str):
+        """Build a transcript output controller with mocked dependencies."""
+        from vocalinux.transcript_output import TranscriptOutputController
         from vocalinux.ui.action_handler import ActionHandler
 
         text_system = MagicMock()
         text_system.inject_text.return_value = True
         action_handler = ActionHandler(text_system)
-        deferred_session_segments = []
-        has_active_recording_session = False
-
-        def reset_session_buffers():
-            deferred_session_segments.clear()
-            action_handler.set_last_injected_text("")
-
-        def commit_deferred_session_text():
-            if output_mode != "deferred_until_release":
-                return
-            if not deferred_session_segments:
-                return
-
-            text_to_inject = " ".join(deferred_session_segments)
-            success = text_system.inject_text(text_to_inject)
-            if success:
-                action_handler.set_last_injected_text(text_to_inject)
-
-        def text_callback_wrapper(text: str):
-            text_to_inject = text.strip()
-            if not text_to_inject:
-                return
-            if output_mode == "deferred_until_release":
-                deferred_session_segments.append(text_to_inject)
-                return
-            if action_handler.last_injected_text and action_handler.last_injected_text.strip():
-                text_to_inject = " " + text_to_inject
-            success = text_system.inject_text(text_to_inject)
-            if success:
-                action_handler.set_last_injected_text(text)
-
-        def on_state_change(state):
-            nonlocal has_active_recording_session
-            if state == "listening":
-                has_active_recording_session = True
-                reset_session_buffers()
-            elif state == "error":
-                has_active_recording_session = False
-                reset_session_buffers()
-            elif state == "idle" and has_active_recording_session:
-                commit_deferred_session_text()
-                has_active_recording_session = False
-                reset_session_buffers()
-
-        return text_callback_wrapper, on_state_change, text_system, action_handler
+        controller = TranscriptOutputController(output_mode, text_system, action_handler)
+        return controller, text_system, action_handler
 
     def test_first_segment_has_no_leading_space(self):
-        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
-        cb("Hello world")
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text("Hello world")
         text_system.inject_text.assert_called_once_with("Hello world")
 
     def test_subsequent_segment_gets_space_separator(self):
-        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
-        cb("Hello")
-        cb("world")
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text("Hello")
+        controller.handle_finalized_text("world")
         calls = [c.args[0] for c in text_system.inject_text.call_args_list]
         self.assertEqual(calls, ["Hello", " world"])
 
     def test_reset_clears_leading_space(self):
-        cb, _, text_system, ah = self._make_callbacks(output_mode="immediate")
-        cb("first session")
-        ah.set_last_injected_text("")
+        from vocalinux.common_types import RecognitionState
+
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text("first session")
+        controller.handle_state_change(RecognitionState.LISTENING)
         text_system.inject_text.reset_mock()
-        cb("second session")
+        controller.handle_finalized_text("second session")
         text_system.inject_text.assert_called_once_with("second session")
 
     def test_whitespace_only_input_is_skipped(self):
-        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
-        cb("   ")
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text("   ")
         text_system.inject_text.assert_not_called()
 
     def test_input_with_leading_space_is_stripped(self):
-        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
-        cb(" Hello world")
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text(" Hello world")
         text_system.inject_text.assert_called_once_with("Hello world")
 
     def test_multiple_segments_all_get_separators(self):
-        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
-        cb("one")
-        cb("two")
-        cb("three")
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text("one")
+        controller.handle_finalized_text("two")
+        controller.handle_finalized_text("three")
         calls = [c.args[0] for c in text_system.inject_text.call_args_list]
         self.assertEqual(calls, ["one", " two", " three"])
 
     def test_space_after_punctuation_segment(self):
-        cb, _, text_system, _ = self._make_callbacks(output_mode="immediate")
-        cb("Hello.")
-        cb("World")
+        controller, text_system, _ = self._make_controller("immediate_injection")
+        controller.handle_finalized_text("Hello.")
+        controller.handle_finalized_text("World")
         calls = [c.args[0] for c in text_system.inject_text.call_args_list]
         self.assertEqual(calls, ["Hello.", " World"])
 
-    def test_deferred_mode_injects_once_on_idle(self):
-        cb, on_state_change, text_system, _ = self._make_callbacks(
-            output_mode="deferred_until_release"
-        )
-        on_state_change("listening")
-        cb("Hello")
-        cb(" world ")
+    def test_preview_mode_buffers_until_commit(self):
+        controller, text_system, _ = self._make_controller("preview_deferred_injection")
+        controller.handle_finalized_text("Hello")
+        controller.handle_finalized_text(" world ")
         text_system.inject_text.assert_not_called()
-        on_state_change("idle")
+        self.assertTrue(controller.commit_pending_text())
         text_system.inject_text.assert_called_once_with("Hello world")
+        self.assertFalse(controller.has_pending_text())
 
-    def test_deferred_mode_resets_on_error(self):
-        cb, on_state_change, text_system, _ = self._make_callbacks(
-            output_mode="deferred_until_release"
-        )
-        on_state_change("listening")
-        cb("partial")
-        on_state_change("error")
-        on_state_change("idle")
+    def test_preview_mode_persists_pending_text_on_idle_and_error(self):
+        from vocalinux.common_types import RecognitionState
+
+        controller, text_system, _ = self._make_controller("preview_deferred_injection")
+        controller.handle_state_change(RecognitionState.LISTENING)
+        controller.handle_finalized_text("partial")
+        controller.handle_state_change(RecognitionState.ERROR)
+        controller.handle_state_change(RecognitionState.IDLE)
         text_system.inject_text.assert_not_called()
+        self.assertEqual(controller.get_pending_text(), "partial")
+
+    def test_preview_mode_discard_clears_without_injection(self):
+        controller, text_system, _ = self._make_controller("preview_deferred_injection")
+        controller.handle_finalized_text("partial")
+        self.assertTrue(controller.discard_pending_text())
+        text_system.inject_text.assert_not_called()
+        self.assertFalse(controller.has_pending_text())
 
 
 if __name__ == "__main__":

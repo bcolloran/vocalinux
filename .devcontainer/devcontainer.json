@@ -1,0 +1,65 @@
+{
+  "name": "vocalinux-dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/vocalinux,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/vocalinux",
+  "shutdownAction": "stopContainer",
+  "runArgs": [
+    "--init",
+    "--device=/dev/snd",
+    "--group-add=audio"
+  ],
+  "mounts": [
+    "source=${localEnv:HOME}/.codex,target=/host-home/.codex,type=bind,readonly,consistency=cached",
+    "source=${localEnv:HOME}/.claude,target=/host-home/.claude,type=bind,readonly,consistency=cached",
+    "source=${localEnv:HOME}/.config/gh,target=/host-home/.config/gh,type=bind,readonly,consistency=cached",
+    "source=${localEnv:HOME}/.config/Code/User,target=/host-home/.config/Code/User,type=bind,readonly,consistency=cached",
+    "source=${localEnv:HOME}/.config/pulse,target=/host-home/.config/pulse,type=bind,readonly,consistency=cached",
+    "source=${localEnv:HOME}/.gitconfig,target=/host-home/.gitconfig,type=bind,readonly,consistency=cached",
+    "source=${localEnv:XDG_RUNTIME_DIR}/pulse,target=/host-runtime/pulse,type=bind,readonly",
+    "source=vocalinux-codex-home,target=/home/vscode/.codex,type=volume",
+    "source=vocalinux-claude-home,target=/home/vscode/.claude,type=volume",
+    "source=vocalinux-gh-config,target=/home/vscode/.config/gh,type=volume",
+    "source=vocalinux-pulse-config,target=/home/vscode/.config/pulse,type=volume",
+    "source=vocalinux-pip-cache,target=/home/vscode/.cache/pip,type=volume",
+    "source=vocalinux-npm-cache,target=/home/vscode/.npm,type=volume",
+    "source=vocalinux-local-share,target=/home/vscode/.local/share,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "debug.javascript.autoAttachFilter": "disabled",
+        "claudeCode.allowDangerouslySkipPermissions": true,
+        "claudeCode.initialPermissionMode": "bypassPermissions",
+        "chat.agent.sandbox": false,
+        "chat.autopilot.enabled": true,
+        "chat.tools.global.autoApprove": true,
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.terminal.activateEnvironment": true
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.isort",
+        "ms-azuretools.vscode-containers",
+        "Anthropic.claude-code",
+        "mhutchie.git-graph",
+        "openai.chatgpt"
+      ]
+    }
+  },
+  "initializeCommand": "mkdir -p ${localEnv:HOME}/.codex ${localEnv:HOME}/.claude ${localEnv:HOME}/.config/gh ${localEnv:HOME}/.config/Code/User/snippets ${localEnv:HOME}/.config/pulse ${localEnv:XDG_RUNTIME_DIR}/pulse && touch ${localEnv:HOME}/.gitconfig",
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "PULSE_SERVER": "unix:/host-runtime/pulse/native",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh"
+}

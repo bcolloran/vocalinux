@@ -422,3 +422,20 @@ class TestAudioFeedback(unittest.TestCase):
         ):
             result = audio_feedback._is_sound_effects_enabled()
             self.assertTrue(result)
+
+    def test_get_sound_diagnostics_reports_current_paths(self):
+        """Test that sound diagnostics include player and file availability."""
+        import vocalinux.ui.audio_feedback as audio_feedback
+
+        with (
+            patch.object(audio_feedback, "_get_audio_player", return_value=("paplay", ["wav"])),
+            patch.object(audio_feedback, "_is_sound_effects_enabled", return_value=True),
+            patch.object(audio_feedback.os.path, "exists", return_value=True),
+        ):
+            diagnostics = audio_feedback.get_sound_diagnostics()
+
+        self.assertEqual(diagnostics["player"], "paplay")
+        self.assertTrue(diagnostics["sound_effects_enabled"])
+        self.assertTrue(diagnostics["start_sound_exists"])
+        self.assertTrue(diagnostics["stop_sound_exists"])
+        self.assertTrue(diagnostics["error_sound_exists"])

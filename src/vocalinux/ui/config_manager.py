@@ -10,6 +10,8 @@ import logging
 import os
 from typing import Any, Optional
 
+from ..transcript_output import OUTPUT_MODE_DEFAULT, normalize_output_mode
+
 logger = logging.getLogger(__name__)
 
 # Define constants
@@ -28,7 +30,7 @@ DEFAULT_CONFIG = {
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping
         "voice_commands_enabled": None,  # None = auto (enabled for VOSK, disabled for Whisper)
-        "output_mode": "deferred_until_release",  # "immediate" or "deferred_until_release"
+        "output_mode": OUTPUT_MODE_DEFAULT,
     },
     "audio": {
         "device_index": None,  # Audio input device index (None for system default)
@@ -39,7 +41,7 @@ DEFAULT_CONFIG = {
     },
     "shortcuts": {
         "toggle_recognition": "ctrl+ctrl",  # Double-tap modifier key
-        "mode": "toggle",  # "toggle" or "push_to_talk"
+        "mode": "push_to_talk",  # "toggle" or "push_to_talk"
         "min_hold_ms": 500,  # Minimum hold duration required to finalize in hold mode
         # Supported values: "ctrl+ctrl", "alt+alt", "shift+shift"
         # These represent double-tap shortcuts for the respective modifier keys
@@ -48,12 +50,17 @@ DEFAULT_CONFIG = {
         "start_minimized": False,
         "show_notifications": True,
     },
+    "preview_window": {
+        "horizontal_placement": "left",  # "left", "center", or "right"
+        "vertical_placement": "top",  # "top", "middle", or "bottom"
+    },
     "general": {
         "autostart": False,
         "first_run": True,
     },
     "text_injection": {
         "copy_to_clipboard": False,  # Disabled by default; users can enable in Settings
+        "typing_delay_ms": 0,  # X11/XWayland xdotool typing delay per character
     },
     "advanced": {
         "debug_logging": False,
@@ -110,6 +117,7 @@ class ConfigManager:
                 self._migrate_config(user_config)
 
             self._migrate_shortcuts_config()
+            self._migrate_output_mode_config()
 
         except (json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load config: {e}")
@@ -171,6 +179,20 @@ class ConfigManager:
                 changed = True
 
         if changed:
+            self.save_config()
+
+    def _migrate_output_mode_config(self):
+        """Normalize saved output modes to the current values."""
+        sr_config = self.config.get("speech_recognition", {})
+        output_mode = sr_config.get("output_mode", OUTPUT_MODE_DEFAULT)
+        normalized_mode = normalize_output_mode(output_mode)
+        if normalized_mode != output_mode:
+            sr_config["output_mode"] = normalized_mode
+            logger.info(
+                "Normalized config output mode from '%s' to '%s'.",
+                output_mode,
+                normalized_mode,
+            )
             self.save_config()
 
     def save_config(self):

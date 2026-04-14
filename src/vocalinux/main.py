@@ -264,10 +264,12 @@ def main():
     from .common_types import RecognitionState
     from .speech_recognition import recognition_manager
     from .text_injection import text_injector
+    from .transcript_output import TranscriptOutputController, normalize_output_mode
     from .ui import tray_indicator
     from .ui.action_handler import ActionHandler
     from .ui.config_manager import ConfigManager
     from .ui.logging_manager import initialize_logging
+    from .ui.preview_window import PreviewWindow
 
     # Initialize logging manager early
     initialize_logging()
@@ -282,10 +284,6 @@ def main():
             logger.debug("IBus daemon started for text injection")
     except Exception as e:
         logger.debug(f"Could not start IBus daemon: {e}")
-
-    config_manager = ConfigManager()
-    initialize_logging()
-    logger.info("Logging system initialized")
 
     config_manager = ConfigManager()
     saved_settings = config_manager.get_settings().get("speech_recognition", {})
@@ -348,15 +346,8 @@ def main():
     vad_sensitivity = saved_settings.get("vad_sensitivity", 3)
     silence_timeout = saved_settings.get("silence_timeout", 2.0)
     voice_commands_enabled = saved_settings.get("voice_commands_enabled")  # None = auto
-    output_mode = saved_settings.get("output_mode", "deferred_until_release")
+    output_mode = normalize_output_mode(saved_settings.get("output_mode"))
     audio_device_index = audio_settings.get("device_index", None)
-
-    if output_mode not in {"immediate", "deferred_until_release"}:
-        logger.warning(
-            "Unknown output mode '%s' in config. Falling back to deferred_until_release.",
-            output_mode,
-        )
-        output_mode = "deferred_until_release"
 
     logger.info(
         "Final settings: engine=%s, language=%s, model=%s, output_mode=%s",
@@ -388,6 +379,12 @@ def main():
 
         # Initialize action handler
         action_handler = ActionHandler(text_system)
+        output_controller = TranscriptOutputController(
+            output_mode=output_mode,
+            text_injector=text_system,
+            action_handler=action_handler,
+        )
+        preview_window = PreviewWindow(output_controller, config_manager=config_manager)
 
         # --- Callback wiring ---------------------------------------------------
         # The speech engine emits three kinds of events, each handled by a
@@ -395,9 +392,9 @@ def main():
         #
         #   text_callback(text: str)
         #       Called on the recognition thread when a transcription segment
-        #       is finalised.  The wrapper below strips whitespace, inserts
-        #       inter-segment spaces, injects the text, and records it so
-        #       "delete that" can undo it.
+        #       is finalised. The wrapper below hands the segment to the
+        #       transcript output controller, which either injects it
+        #       immediately or buffers it for preview-mode review.
         #
         #   action_callback(action: str) -> bool
         #       Called when a voice command (e.g. "undo", "select all") is
@@ -405,73 +402,16 @@ def main():
         #
         #   state_callback(state: RecognitionState)
         #       Called whenever the engine transitions state (IDLE → LISTENING,
-        #       etc.).  Used here to clear the "last injected" buffer when a
-        #       new listening session starts.
+        #       etc.). Used here to keep transcript output lifecycle state in sync.
         # ------------------------------------------------------------------
 
-        deferred_session_segments: list[str] = []
-        has_active_recording_session = False
-
-        def reset_session_buffers() -> None:
-            """Reset per-session buffered output."""
-            deferred_session_segments.clear()
-            action_handler.set_last_injected_text("")
-
-        def commit_deferred_session_text() -> None:
-            """Inject buffered finalized segments once for deferred output mode."""
-            if output_mode != "deferred_until_release":
-                return
-            if not deferred_session_segments:
-                return
-
-            text_to_inject = " ".join(deferred_session_segments)
-            success = text_system.inject_text(text_to_inject)
-            if success:
-                action_handler.set_last_injected_text(text_to_inject)
-
         def text_callback_wrapper(text: str) -> None:
-            """Bridge between speech engine text events and the text injector.
-
-            Called on the recognition thread with each finalised transcription
-            segment.  Strips leading/trailing whitespace (whisper tokenizer
-            sometimes prepends spaces), inserts a single space between
-            consecutive segments, then injects via TextInjector.
-
-            Args:
-                text: Raw transcription segment from the speech engine.
-            """
-            text_to_inject = text.strip()
-            if not text_to_inject:
-                return
-
-            if output_mode == "deferred_until_release":
-                deferred_session_segments.append(text_to_inject)
-                return
-
-            # Add a separating space between consecutive dictation segments,
-            # but never for the very first segment (avoids unwanted leading space
-            # when starting dictation in an empty text field).
-            if action_handler.last_injected_text and action_handler.last_injected_text.strip():
-                text_to_inject = " " + text_to_inject
-                logger.debug("Added space separator before new segment")
-
-            success = text_system.inject_text(text_to_inject)
-            if success:
-                action_handler.set_last_injected_text(text)
+            """Bridge finalized recognition text into the transcript output controller."""
+            output_controller.handle_finalized_text(text)
 
         def on_state_change(state: RecognitionState) -> None:
-            """Reset the last-injected buffer when a new listening session starts."""
-            nonlocal has_active_recording_session
-            if state == RecognitionState.LISTENING:
-                has_active_recording_session = True
-                reset_session_buffers()
-            elif state == RecognitionState.ERROR:
-                has_active_recording_session = False
-                reset_session_buffers()
-            elif state == RecognitionState.IDLE and has_active_recording_session:
-                commit_deferred_session_text()
-                has_active_recording_session = False
-                reset_session_buffers()
+            """Pass recognition state changes into the transcript output controller."""
+            output_controller.handle_state_change(state)
 
         # Connect speech recognition to text injection and action handling
         speech_engine.register_text_callback(text_callback_wrapper)
@@ -482,7 +422,10 @@ def main():
         indicator = tray_indicator.TrayIndicator(
             speech_engine=speech_engine,
             text_injector=text_system,
+            output_controller=output_controller,
+            preview_window=preview_window,
         )
+        preview_window.cancel_callback = indicator._on_escape_pressed
 
         # Start the GTK main loop
         indicator.run()

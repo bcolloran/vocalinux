@@ -121,8 +121,8 @@ print_info "=============================="
 echo ""
 
 # Parse command line arguments
-KEEP_CONFIG="no"
-KEEP_DATA="no"
+KEEP_CONFIG="yes"
+KEEP_DATA="yes"
 VENV_DIR="venv"
 NON_INTERACTIVE="no"
 
@@ -141,6 +141,19 @@ while [[ $# -gt 0 ]]; do
             KEEP_DATA="yes"
             shift
             ;;
+        --remove-config)
+            KEEP_CONFIG="no"
+            shift
+            ;;
+        --remove-data)
+            KEEP_DATA="no"
+            shift
+            ;;
+        --purge)
+            KEEP_CONFIG="no"
+            KEEP_DATA="no"
+            shift
+            ;;
         --venv-dir=*)
             VENV_DIR="${1#*=}"
             shift
@@ -153,8 +166,11 @@ while [[ $# -gt 0 ]]; do
             echo "Vocalinux Uninstaller"
             echo "Usage: $0 [options]"
             echo "Options:"
-            echo "  --keep-config     Keep configuration files"
-            echo "  --keep-data       Keep application data (models, etc.)"
+            echo "  --keep-config     Keep configuration files (default)"
+            echo "  --keep-data       Keep application data (models, etc.) (default)"
+            echo "  --remove-config   Remove configuration files"
+            echo "  --remove-data     Remove application data (models, etc.)"
+            echo "  --purge           Remove both configuration and application data"
             echo "  --venv-dir=PATH   Specify custom virtual environment directory (default: venv)"
             echo "  -y, --yes         Non-interactive mode (no confirmation prompts)"
             echo "  --help            Show this help message"
@@ -196,12 +212,14 @@ else
         exit 0
     fi
     
-    if [[ "$KEEP_DATA" != "yes" ]]; then
-        read -p "Do you want to keep your data (models, config)? (y/N) " -n 1 -r
+    if [[ "$KEEP_DATA" == "yes" && "$KEEP_CONFIG" == "yes" ]]; then
+        read -p "Do you want to remove your data (models, config)? (y/N) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            KEEP_DATA="yes"
-            KEEP_CONFIG="yes"
+            KEEP_DATA="no"
+            KEEP_CONFIG="no"
+            print_warning "Data and configuration will be removed."
+        else
             print_info "Data and configuration will be preserved."
         fi
     fi
