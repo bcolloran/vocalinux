@@ -50,12 +50,17 @@ DEFAULT_CONFIG = {
         "start_minimized": False,
         "show_notifications": True,
     },
+    "preview_window": {
+        "horizontal_placement": "left",  # "left", "center", or "right"
+        "vertical_placement": "top",  # "top", "middle", or "bottom"
+    },
     "general": {
         "autostart": False,
         "first_run": True,
     },
     "text_injection": {
         "copy_to_clipboard": False,  # Disabled by default; users can enable in Settings
+        "typing_delay_ms": 0,  # X11/XWayland xdotool typing delay per character
     },
     "advanced": {
         "debug_logging": False,

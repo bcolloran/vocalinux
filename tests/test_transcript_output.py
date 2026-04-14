@@ -88,9 +88,13 @@ class TestTranscriptOutputController(unittest.TestCase):
         controller.update_live_preview_text("live preview text")
         self.assertTrue(controller.commit_live_preview_text())
         controller.handle_finalized_text("finalized text")
+        controller.handle_finalized_text("another finalized text")
+        controller.handle_state_change(RecognitionState.IDLE)
+        controller.handle_state_change(RecognitionState.LISTENING)
+        controller.handle_finalized_text("post idle text")
 
         text_injector.inject_text.assert_called_once_with("live preview text")
-        self.assertFalse(controller.has_pending_text())
+        self.assertEqual(controller.get_pending_text(), "post idle text")
 
     def test_live_preview_cancel_suppresses_next_finalized_callback(self):
         controller, text_injector = self._make_controller(OUTPUT_MODE_PREVIEW)

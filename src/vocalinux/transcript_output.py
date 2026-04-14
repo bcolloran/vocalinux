@@ -136,7 +136,7 @@ class TranscriptOutputController:
         self.output_mode = normalize_output_mode(output_mode)
         self._mode_listeners: list[Callable[[str], None]] = []
         self._live_preview_text = ""
-        self._skip_next_finalized_text = False
+        self._suppress_finalized_text_until_idle = False
         self._push_to_talk_session_active = False
 
     def is_preview_mode(self) -> bool:
@@ -204,13 +204,13 @@ class TranscriptOutputController:
     def commit_live_preview_text(self) -> bool:
         """Inject the current live preview text and suppress the later finalized callback."""
         live_preview_text = self._live_preview_text.strip()
-        self._skip_next_finalized_text = True
+        self._suppress_finalized_text_until_idle = True
         self._push_to_talk_session_active = False
 
         if not live_preview_text:
             logger.info(
-                "HTT release commit requested with no live preview text; finalized callback will "
-                "be suppressed."
+                "HTT release commit requested with no live preview text; finalized callbacks "
+                "will be suppressed until idle."
             )
             self._live_preview_text = ""
             return False
@@ -225,10 +225,12 @@ class TranscriptOutputController:
 
     def cancel_live_preview_session(self) -> None:
         """Cancel the current HTT preview session and suppress the later finalized callback."""
-        self._skip_next_finalized_text = True
+        self._suppress_finalized_text_until_idle = True
         self._push_to_talk_session_active = False
         self._live_preview_text = ""
-        logger.info("Cancelled HTT live preview session; finalized callback will be suppressed.")
+        logger.info(
+            "Cancelled HTT live preview session; finalized callbacks will be suppressed until idle."
+        )
 
     def end_live_preview_session(self) -> None:
         """End the current HTT preview session without suppressing finalized callbacks."""
@@ -250,11 +252,10 @@ class TranscriptOutputController:
             )
             return
 
-        if self._skip_next_finalized_text:
-            self._skip_next_finalized_text = False
+        if self._suppress_finalized_text_until_idle:
             logger.info(
                 "Skipping finalized text callback because transcript was already committed or "
-                "cancelled from live preview."
+                "cancelled from live preview and suppression remains active until idle."
             )
             return
 
@@ -283,6 +284,7 @@ class TranscriptOutputController:
         """Update output state in response to recognition state changes."""
         if state == RecognitionState.LISTENING:
             self.action_handler.set_last_injected_text("")
+            self._suppress_finalized_text_until_idle = False
             logger.info(
                 "Recognition session started in %s mode. Pending transcript currently %s.",
                 self.output_mode,
@@ -292,6 +294,7 @@ class TranscriptOutputController:
 
         if state == RecognitionState.IDLE:
             self._push_to_talk_session_active = False
+            self._suppress_finalized_text_until_idle = False
             if self.is_preview_mode() and self.pending_store.has_text():
                 logger.info(
                     "Recognition stopped with pending transcript ready for review (%s character(s)).",

@@ -8,14 +8,12 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
+from conftest import mock_audio_feedback
+
 # Update import path to use the new package structure
 from vocalinux.text_injection.text_injector import DesktopEnvironment, TextInjector
 
-# Create a mock for audio feedback module
-mock_audio_feedback = MagicMock()
-mock_audio_feedback.play_error_sound = MagicMock()
-
-# Add the mock to sys.modules
+# Reuse the shared test audio feedback mock to avoid cross-test module drift.
 sys.modules["vocalinux.ui.audio_feedback"] = mock_audio_feedback
 
 
@@ -283,6 +281,34 @@ class TestTextInjector(unittest.TestCase):
 
         # Still no subprocess calls
         self.mock_subprocess.assert_not_called()
+
+    def test_xdotool_uses_configured_delay_without_escape_reset(self):
+        """X11 injection should honor configured typing delay and not synthesize Escape."""
+        injector = TextInjector()
+        injector.environment = DesktopEnvironment.X11
+
+        calls = []
+
+        def capture_call(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("args"))
+            process = MagicMock()
+            process.returncode = 0
+            process.stderr = ""
+            return process
+
+        self.mock_subprocess.side_effect = capture_call
+
+        with patch.object(injector, "_get_xdotool_typing_delay_ms", return_value=7):
+            injector._inject_with_xdotool("hello world")
+
+        type_calls = [cmd for cmd in calls if isinstance(cmd, list) and "type" in cmd]
+        self.assertTrue(type_calls)
+        self.assertIn("--delay", type_calls[0])
+        self.assertIn("7", type_calls[0])
+        self.assertFalse(
+            any(isinstance(cmd, list) and "Escape" in cmd for cmd in calls),
+            "Text injection should not synthesize Escape after typing",
+        )
 
     def test_missing_dependencies(self):
         """Test error when no text injection dependencies are available."""

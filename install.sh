@@ -115,6 +115,7 @@ PREVIOUS_WHISPERCPP_BACKEND=""
 PREVIOUS_SKIP_MODELS="no"
 PREVIOUS_EFFECTIVE_ENGINE=""
 PREVIOUS_INSTALL_MODE=""
+PREVIOUS_INSTALL_CONFIG_SOURCE=""
 HAS_NVIDIA_GPU="unknown"
 GPU_NAME=""
 GPU_MEMORY=""
@@ -126,6 +127,8 @@ DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vocalinux"
 DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
 INSTALL_CONFIG_FILE="$CONFIG_DIR/install_config.json"
+INSTALL_CONFIG_DATA_FILE="$DATA_DIR/install_config.json"
+APP_CONFIG_FILE="$CONFIG_DIR/config.json"
 
 # Detect if running non-interactively (e.g., via curl | bash)
 # If stdin is a pipe but /dev/tty exists, redirect stdin so user input works normally.
@@ -868,18 +871,21 @@ format_models_display() {
 }
 
 load_previous_install_config() {
-    if [[ ! -f "$INSTALL_CONFIG_FILE" ]]; then
-        return 1
-    fi
-
     local PYTHON_BIN
     if ! PYTHON_BIN=$(get_json_python); then
         print_warning "Python is unavailable, so previous install configuration cannot be read."
         return 1
     fi
 
-    local PARSED_CONFIG
-    if ! PARSED_CONFIG=$("$PYTHON_BIN" - "$INSTALL_CONFIG_FILE" <<'PY'
+    local CONFIG_SOURCE=""
+    local PARSED_CONFIG=""
+
+    for CANDIDATE_PATH in "$INSTALL_CONFIG_FILE" "$INSTALL_CONFIG_DATA_FILE"; do
+        if [[ ! -f "$CANDIDATE_PATH" ]]; then
+            continue
+        fi
+
+        if PARSED_CONFIG=$("$PYTHON_BIN" - "$CANDIDATE_PATH" <<'PY'
 import json
 import sys
 
@@ -914,8 +920,43 @@ print(f"skip_models={'yes' if skip_models else 'no'}")
 print(f"effective_engine={effective_engine}")
 print(f"install_mode={install_mode}")
 PY
-    ); then
-        print_warning "Ignoring invalid previous install configuration: $INSTALL_CONFIG_FILE"
+        ); then
+            CONFIG_SOURCE="$CANDIDATE_PATH"
+            break
+        fi
+
+        print_warning "Ignoring invalid previous install configuration: $CANDIDATE_PATH"
+    done
+
+    if [[ -z "$CONFIG_SOURCE" && -f "$APP_CONFIG_FILE" ]]; then
+        if PARSED_CONFIG=$("$PYTHON_BIN" - "$APP_CONFIG_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+speech = data.get("speech_recognition", {})
+selected_engine = speech.get("engine", "")
+if selected_engine not in {"whisper_cpp", "whisper", "vosk"}:
+    raise SystemExit(1)
+
+print(f"selected_engine={selected_engine}")
+print("whispercpp_backend_choice=")
+print("skip_models=no")
+print(f"effective_engine={selected_engine}")
+print("install_mode=")
+PY
+        ); then
+            CONFIG_SOURCE="$APP_CONFIG_FILE"
+        else
+            print_warning "Ignoring invalid application configuration fallback: $APP_CONFIG_FILE"
+        fi
+    fi
+
+    if [[ -z "$CONFIG_SOURCE" ]]; then
         return 1
     fi
 
@@ -924,6 +965,7 @@ PY
     PREVIOUS_SKIP_MODELS="no"
     PREVIOUS_EFFECTIVE_ENGINE=""
     PREVIOUS_INSTALL_MODE=""
+    PREVIOUS_INSTALL_CONFIG_SOURCE="$CONFIG_SOURCE"
 
     while IFS='=' read -r KEY VALUE; do
         case "$KEY" in
@@ -971,7 +1013,7 @@ maybe_use_previous_install_config() {
 
     print_header "Previous Installation Configuration"
     echo "Found previous install configuration in:"
-    echo "  $INSTALL_CONFIG_FILE"
+    echo "  $PREVIOUS_INSTALL_CONFIG_SOURCE"
     echo ""
     echo "  Engine: $(format_engine_display "$PREVIOUS_SELECTED_ENGINE")"
     if [[ "$PREVIOUS_SELECTED_ENGINE" == "whisper_cpp" ]]; then
@@ -1014,6 +1056,8 @@ save_install_config() {
     local BACKEND_CHOICE_JSON="null"
     local EFFECTIVE_BACKEND_JSON="null"
     local SKIP_MODELS_JSON="false"
+    local INSTALL_CONFIG_JSON=""
+    local SAVE_COUNT=0
 
     if [[ "$NON_INTERACTIVE" == "yes" || "$AUTO_MODE" == "yes" ]]; then
         INSTALL_MODE_VALUE="automatic"
@@ -1031,18 +1075,7 @@ save_install_config() {
         SKIP_MODELS_JSON="true"
     fi
 
-    mkdir -p "$CONFIG_DIR" || {
-        print_warning "Failed to create installer config directory: $CONFIG_DIR"
-        return 1
-    }
-
-    local TMP_INSTALL_CONFIG
-    TMP_INSTALL_CONFIG=$(mktemp "${INSTALL_CONFIG_FILE}.tmp.XXXXXX") || {
-        print_warning "Failed to create temporary installer config file."
-        return 1
-    }
-
-    cat > "$TMP_INSTALL_CONFIG" <<EOF
+    INSTALL_CONFIG_JSON=$(cat <<EOF
 {
   "version": 1,
   "selected_engine": "$SELECTED_ENGINE_VALUE",
@@ -1054,14 +1087,52 @@ save_install_config() {
   "install_tag": "${INSTALL_TAG:-unknown}"
 }
 EOF
+)
 
-    mv "$TMP_INSTALL_CONFIG" "$INSTALL_CONFIG_FILE" || {
-        rm -f "$TMP_INSTALL_CONFIG"
-        print_warning "Failed to save installer configuration to $INSTALL_CONFIG_FILE"
-        return 1
+    write_install_config_file() {
+        local TARGET_FILE="$1"
+        local TARGET_DIR
+        TARGET_DIR=$(dirname "$TARGET_FILE")
+
+        mkdir -p "$TARGET_DIR" || {
+            print_warning "Failed to create installer config directory: $TARGET_DIR"
+            return 1
+        }
+
+        local TMP_INSTALL_CONFIG
+        TMP_INSTALL_CONFIG=$(mktemp "${TARGET_FILE}.tmp.XXXXXX") || {
+            print_warning "Failed to create temporary installer config file for $TARGET_FILE"
+            return 1
+        }
+
+        printf "%s\n" "$INSTALL_CONFIG_JSON" > "$TMP_INSTALL_CONFIG" || {
+            rm -f "$TMP_INSTALL_CONFIG"
+            print_warning "Failed to write temporary installer config file for $TARGET_FILE"
+            return 1
+        }
+
+        mv "$TMP_INSTALL_CONFIG" "$TARGET_FILE" || {
+            rm -f "$TMP_INSTALL_CONFIG"
+            print_warning "Failed to save installer configuration to $TARGET_FILE"
+            return 1
+        }
+
+        print_info "Saved installer configuration to $TARGET_FILE"
+        return 0
     }
 
-    print_info "Saved installer configuration to $INSTALL_CONFIG_FILE"
+    if write_install_config_file "$INSTALL_CONFIG_FILE"; then
+        SAVE_COUNT=$((SAVE_COUNT + 1))
+    fi
+
+    if write_install_config_file "$INSTALL_CONFIG_DATA_FILE"; then
+        SAVE_COUNT=$((SAVE_COUNT + 1))
+    fi
+
+    if [[ "$SAVE_COUNT" -eq 0 ]]; then
+        return 1
+    fi
+
     return 0
 }
 
@@ -1343,6 +1414,7 @@ if [[ "$INTERACTIVE_MODE" == "ask" ]]; then
     if load_previous_install_config; then
         echo ""
         echo "Previous installation configuration found:"
+        echo "  Source: $PREVIOUS_INSTALL_CONFIG_SOURCE"
         echo "  Engine: $(format_engine_display "$PREVIOUS_SELECTED_ENGINE")"
         if [[ "$PREVIOUS_SELECTED_ENGINE" == "whisper_cpp" ]]; then
             echo "  Backend: $(format_backend_choice_display "$PREVIOUS_WHISPERCPP_BACKEND")"

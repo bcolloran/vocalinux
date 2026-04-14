@@ -1,117 +1,224 @@
 # Architecture: Current State
 
-This document describes the current dictation pipeline and control/data flow from microphone capture to text injection.
+This document describes the current runtime pipeline in Vocalinux after the MVP
+preview work landed.
+
+## Runtime Overview
+
+The app now has two transcript output paths:
+
+- `immediate_injection`
+  - finalized dictated text is injected as soon as it is produced
+- `preview_deferred_injection`
+  - finalized dictated text is buffered for explicit `Commit` / `Discard`
+
+There is also a special **hold-to-transcribe live preview path**:
+
+- when HTT starts, the preview window opens immediately
+- incremental preview text becomes the source of truth for HTT release
+- on release, the current live preview text is injected immediately
+- on `Esc`, the HTT session is cancelled and trailing finalized callbacks are suppressed until idle
 
 ## Pipeline Walkthrough
 
 ## 1) `_record_audio` (capture thread)
 
-`SpeechRecognitionManager.start_recognition()` starts `_record_audio` on `audio_thread`.
+`SpeechRecognitionManager.start_recognition()` starts `_record_audio` on
+`audio_thread`.
 
-What `_record_audio` does today:
+What `_record_audio` does:
 
-- Opens PyAudio input stream (with reconnection logic).
-- Reads chunks into `self.audio_buffer` under lock.
-- Performs channel normalization/resampling to 16kHz when needed.
-- Runs simple VAD/silence logic:
-  - In `toggle` mode: on silence timeout, enqueues buffered segment via `_enqueue_audio_segment(...)` and clears buffer.
-  - In `push_to_talk` mode: defers enqueue until key release / stop path.
-- Emits audio-level callbacks for UI metering.
+- opens the PyAudio input stream
+- reads chunks into `self.audio_buffer` under lock
+- normalizes channels / sample rate as needed
+- applies silence logic
+  - in `toggle` mode, finalized chunks are enqueued on silence timeout
+  - in `push_to_talk` mode, enqueue is deferred until release / stop
+- emits audio-level callbacks for UI metering
 
 ## 2) `_perform_recognition` (recognition thread)
 
-`start_recognition()` also starts `_perform_recognition` on `recognition_thread`.
+`start_recognition()` also starts `_perform_recognition` on
+`recognition_thread`.
 
-What `_perform_recognition` does today:
+What `_perform_recognition` does:
 
-- Drains `_segment_queue` in a loop.
-- For each segment:
-  - sets state to `PROCESSING`,
-  - calls `_process_audio_buffer(segment)`,
-  - sets state back to `LISTENING` if still recording.
-- Handles stop via queue sentinel (`None`) and queue-drain logic.
+- drains `_segment_queue`
+- for each segment:
+  - sets state to `PROCESSING`
+  - calls `_process_audio_buffer(segment)`
+  - returns to `LISTENING` if recording continues
+- handles stop via queue sentinel and queue-drain logic
 
 ## 3) `_process_audio_buffer` (transcribe + parse)
 
 For each immutable audio segment:
 
-- Dispatches by engine:
-  - `vosk` via recognizer `AcceptWaveform`/`FinalResult`,
-  - `whisper` via `_transcribe_with_whisper`,
-  - `whisper_cpp` via `_transcribe_with_whispercpp`.
-- Runs command processor (if voice commands enabled):
-  - returns `(processed_text, actions)`.
-- Emits callbacks:
-  - `text_callbacks(processed_text)` for dictation text,
-  - `action_callbacks(action)` for commands.
+- transcribes through the selected engine
+  - `vosk`
+  - `whisper`
+  - `whisper_cpp`
+- runs the command processor when voice commands are enabled
+- emits:
+  - `text_callbacks(processed_text)` for dictated text
+  - `action_callbacks(action)` for commands
 
-## 4) `main.py` callback bridge to injection
+Incremental preview text is emitted separately through preview callbacks during
+active recognition.
 
-`main.py` wires callbacks:
+## 4) `main.py` callback bridge
 
-- `register_text_callback(text_callback_wrapper)`
+`main.py` now wires recognition into a transcript output controller instead of
+injecting dictated text directly from the callback wrapper.
+
+Current callback wiring:
+
+- `register_text_callback(output_controller.handle_finalized_text)`
+- `register_preview_callback(tray_indicator._on_preview_text_changed)`
 - `register_action_callback(action_handler.handle_action)`
 - `register_state_callback(on_state_change)`
 
-`text_callback_wrapper` behavior:
+`on_state_change(...)` fans recognition state into:
 
-- strip segment text,
-- prepend a space between consecutive injected segments,
-- call `text_system.inject_text(...)`,
-- record last injected text for undo/delete behavior.
+- `output_controller.handle_state_change(...)`
+- tray / preview UI updates
 
-So today, **recognized text is injected immediately from callback path**.
+## 5) `TranscriptOutputController`
 
-## Callback/Data-Flow Diagram (Current)
+`TranscriptOutputController` is now the central output-policy layer.
+
+It owns:
+
+- output mode normalization
+- pending transcript accumulation through `PendingTranscriptStore`
+- immediate injection spacing behavior
+- HTT live preview commit / cancel suppression
+
+Behavior by mode:
+
+- `immediate_injection`
+  - finalized text injects immediately through `TextInjector`
+- `preview_deferred_injection`
+  - finalized text is appended to pending transcript
+  - explicit commit injects the full pending transcript once
+  - discard clears without injection
+
+Special HTT behavior:
+
+- `begin_push_to_talk_preview_session()`
+  - marks the live preview session active
+- `commit_live_preview_text()`
+  - injects the current live preview immediately
+  - suppresses later finalized callbacks until idle
+- `cancel_live_preview_session()`
+  - clears live preview state
+  - suppresses later finalized callbacks until idle
+
+## 6) Tray + Preview Window
+
+`TrayIndicator` is now the main HTT preview orchestrator.
+
+What it does:
+
+- opens the preview window when HTT starts
+- forwards incremental preview text to both:
+  - tray live preview label
+  - preview window live preview area
+- commits live preview text on HTT release
+- cancels HTT session on global `Esc`
+- shows pending transcript in the preview window for explicit commit / discard
+
+The preview surface is currently a standalone GTK utility window, not a
+tray-attached popover.
+
+## Current Data-Flow Diagram
 
 ```mermaid
 flowchart LR
   Mic[Microphone] --> A[_record_audio\n(audio_thread)]
-  A -->|silence / stop| Q[_segment_queue]
+  A -->|silence / release / stop| Q[_segment_queue]
   Q --> R[_perform_recognition\n(recognition_thread)]
   R --> P[_process_audio_buffer]
-  P -->|processed_text| TC[text_callbacks]
+  P -->|finalized text| TC[text_callbacks]
+  P -->|preview text| PC[preview_callbacks]
   P -->|actions| AC[action_callbacks]
-  TC --> M[text_callback_wrapper in main.py]
-  M --> TI[TextInjector.inject_text]
-  AC --> AH[ActionHandler.handle_action]
-  AH --> TI
+
+  subgraph GTK[GTK Main Thread]
+    TOC[TranscriptOutputController]
+    PTS[PendingTranscriptStore]
+    TRAY[TrayIndicator]
+    PW[PreviewWindow]
+    AH[ActionHandler]
+    TI[TextInjector.inject_text]
+  end
+
+  TC --> TOC
+  TOC -->|preview mode| PTS
+  PTS --> PW
+  TOC -->|immediate mode / HTT live commit| TI
+  PC --> TRAY
+  TRAY --> PW
+  AC --> AH --> TI
 ```
 
 ## Threading Model
 
-- **GTK main thread**
-  - App lifecycle, tray UI, most UI interactions.
-- **Audio capture thread**
-  - `_record_audio`, microphone reads, VAD chunking.
-- **Recognition thread**
-  - `_perform_recognition`, queue-drain and per-segment transcription.
+- GTK main thread
+  - tray UI
+  - preview window UI
+  - settings dialog
+  - most output-policy state changes
+- audio capture thread
+  - microphone reads
+  - buffering
+  - silence segmentation
+- recognition thread
+  - queue draining
+  - transcription
+  - finalized / preview callback emission
 
-### Shared structures and synchronization
+### Shared structures
 
-- `self.audio_buffer` protected by `self._buffer_lock` during mutation/copy.
-- Model/recognizer access guarded via `self._model_lock` in critical sections.
-- Segment handoff uses thread-safe `queue.Queue` (`self._segment_queue`).
+- `self.audio_buffer`
+  - protected by `self._buffer_lock`
+- model / recognizer state
+  - protected by `self._model_lock`
+- `_segment_queue`
+  - thread-safe handoff between capture and recognition
+- `PendingTranscriptStore`
+  - internal lock for append / clear / read / listener snapshots
 
-## State Transitions (Current)
+## State Notes
 
-Recognition states are: `IDLE`, `LISTENING`, `PROCESSING`, `ERROR`.
+Recognition states remain:
 
-```mermaid
-stateDiagram-v2
-  [*] --> IDLE
-  IDLE --> LISTENING: start_recognition()
-  LISTENING --> PROCESSING: segment dequeued
-  PROCESSING --> LISTENING: segment done && should_record
-  LISTENING --> IDLE: stop_recognition()
-  PROCESSING --> IDLE: stop + queue drained
-  LISTENING --> ERROR: audio/import/runtime failure
-  PROCESSING --> ERROR: transcription/runtime failure
-  ERROR --> IDLE: restart / re-init flow
-```
+- `IDLE`
+- `LISTENING`
+- `PROCESSING`
+- `ERROR`
 
-## Notes on Current Behavior
+Important additions:
 
-- Stop path tries to avoid stop-sound transcription by discarding tail audio chunks before final enqueue.
-- Immediate injection happens in text callback path, not in GTK event-loop-owned workflow.
-- Push-to-talk behavior differs at VAD enqueue boundary (defers until release/stop).
+- HTT preview session state is tracked outside the recognition state enum
+- finalized-text suppression now persists until `IDLE` after HTT commit/cancel
+  so late recognition callbacks cannot double-inject text
+
+## Practical Behavior Summary
+
+- toggle mode + immediate output:
+  - behaves like classic Vocalinux
+- toggle mode + preview output:
+  - finalized text buffers until manual `Commit` / `Discard`
+- HTT:
+  - always uses the live preview release flow when preview window/controller are available
+  - release injects live preview text
+  - `Esc` cancels
+
+## Known Architectural Follow-Ups
+
+- preview window ownership still lives partly in `TrayIndicator`; this could be
+  separated into a dedicated controller later
+- xdotool injection is still simulated typing, not a true paste-style commit
+- output behavior is now richer, but recognition/session state is still managed
+  by a small mix of explicit state plus helper flags rather than a formal state
+  machine

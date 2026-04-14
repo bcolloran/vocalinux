@@ -23,6 +23,9 @@ from .ibus_engine import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_XDOTOOL_TYPING_DELAY_MS = 0
+DEFAULT_XDOTOOL_CHUNK_SIZE = 200
+
 
 class DesktopEnvironment(Enum):
     """Enum representing the desktop environment."""
@@ -389,6 +392,23 @@ class TextInjector:
             logger.debug(f"Could not read copy_to_clipboard setting: {e}")
         return False
 
+    def _get_xdotool_typing_delay_ms(self) -> int:
+        """Read the configured xdotool per-character typing delay."""
+        try:
+            import json
+
+            config_path = os.path.expanduser("~/.config/vocalinux/config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                delay_ms = config.get("text_injection", {}).get(
+                    "typing_delay_ms", DEFAULT_XDOTOOL_TYPING_DELAY_MS
+                )
+                return max(0, int(delay_ms))
+        except Exception as e:
+            logger.debug(f"Could not read typing_delay_ms setting: {e}")
+        return DEFAULT_XDOTOOL_TYPING_DELAY_MS
+
     def _show_clipboard_fallback_notification(self):
         """Show a desktop notification when text is copied to clipboard as fallback."""
         try:
@@ -561,12 +581,18 @@ class TextInjector:
         # Inject text using xdotool
         try:
             max_retries = 2
+            typing_delay_ms = self._get_xdotool_typing_delay_ms()
+            chunk_size = DEFAULT_XDOTOOL_CHUNK_SIZE
             logger.debug(f"Starting xdotool injection with {max_retries} max retries")
+            logger.info(
+                "Using xdotool typing settings: delay_ms=%s chunk_size=%s",
+                typing_delay_ms,
+                chunk_size,
+            )
 
             for retry in range(max_retries + 1):
                 try:
                     # Inject in smaller chunks to avoid issues with very long text
-                    chunk_size = 20  # Reduced chunk size for better reliability
                     total_chunks = (len(text) + chunk_size - 1) // chunk_size
                     logger.debug(
                         f"Splitting text into {total_chunks} chunks of max {chunk_size} chars"
@@ -576,8 +602,14 @@ class TextInjector:
                         chunk = text[i : i + chunk_size]
                         chunk_num = (i // chunk_size) + 1
 
-                        # First try with clearmodifiers
-                        cmd = ["xdotool", "type", "--clearmodifiers", chunk]
+                        cmd = [
+                            "xdotool",
+                            "type",
+                            "--clearmodifiers",
+                            "--delay",
+                            str(typing_delay_ms),
+                            chunk,
+                        ]
                         logger.debug(f"Injecting chunk {chunk_num}/{total_chunks}: '{chunk}'")
 
                         subprocess.run(
@@ -589,9 +621,8 @@ class TextInjector:
                             timeout=5,
                         )
 
-                        # Add a larger delay between chunks
                         if i + chunk_size < len(text):
-                            time.sleep(0.1)
+                            time.sleep(0.01)
 
                     logger.info(
                         f"Text injected using xdotool: '{text[:20]}...' ({len(text)} chars)"
@@ -616,18 +647,6 @@ class TextInjector:
                     else:
                         logger.error("Text injection timed out on final attempt")
                         raise
-
-            # Try to reset any stuck modifiers
-            try:
-                subprocess.run(
-                    ["xdotool", "key", "--clearmodifiers", "Escape"],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            except Exception:
-                pass  # Ignore any errors from this command
         except subprocess.CalledProcessError as e:
             logger.error(f"xdotool error: {e.stderr}")
             raise

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import gi
 
@@ -13,7 +13,24 @@ from gi.repository import Gdk, Gtk
 
 from ..transcript_output import OUTPUT_MODE_PREVIEW, TranscriptOutputController
 
+if TYPE_CHECKING:
+    from .config_manager import ConfigManager
+
 logger = logging.getLogger(__name__)
+
+PREVIEW_HORIZONTAL_OPTIONS = {
+    "left": "Left",
+    "center": "Center",
+    "right": "Right",
+}
+
+PREVIEW_VERTICAL_OPTIONS = {
+    "top": "Top",
+    "middle": "Mid",
+    "bottom": "Bottom",
+}
+
+_PREVIEW_WINDOW_MARGIN_PX = 24
 
 
 class PreviewWindow(Gtk.Window):
@@ -22,10 +39,12 @@ class PreviewWindow(Gtk.Window):
     def __init__(
         self,
         controller: TranscriptOutputController,
+        config_manager: "ConfigManager | None" = None,
         cancel_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(title="Pending Transcript Review")
         self.controller = controller
+        self.config_manager = config_manager
         self.cancel_callback = cancel_callback
         self.output_mode = controller.output_mode
         self.pending_text = controller.get_pending_text()
@@ -118,12 +137,86 @@ class PreviewWindow(Gtk.Window):
             bool(self.pending_text),
             steal_focus,
         )
-        self.move(0, 0)
         self.set_accept_focus(steal_focus)
         self.set_focus_on_map(steal_focus)
         self.show_all()
+        self._position_window()
         if steal_focus:
             self.present()
+
+    def _get_preview_placement(self) -> tuple[str, str]:
+        """Read and validate preview placement settings."""
+        horizontal = "left"
+        vertical = "top"
+
+        if self.config_manager is not None:
+            try:
+                self.config_manager.load_config()
+                horizontal = self.config_manager.get_str(
+                    "preview_window", "horizontal_placement", horizontal
+                ).lower()
+                vertical = self.config_manager.get_str(
+                    "preview_window", "vertical_placement", vertical
+                ).lower()
+            except Exception as exc:
+                logger.warning("Failed to load preview window placement settings: %s", exc)
+
+        if horizontal not in PREVIEW_HORIZONTAL_OPTIONS:
+            horizontal = "left"
+        if vertical not in PREVIEW_VERTICAL_OPTIONS:
+            vertical = "top"
+
+        return horizontal, vertical
+
+    def _position_window(self) -> None:
+        """Position the preview window according to the current placement settings."""
+        screen = self.get_screen() or Gdk.Screen.get_default()
+        if screen is None:
+            logger.warning("No GDK screen available for preview window positioning.")
+            return
+
+        monitor_index = screen.get_primary_monitor()
+        if monitor_index < 0:
+            monitor_index = 0
+        geometry = screen.get_monitor_geometry(monitor_index)
+        default_width, default_height = self.get_default_size()
+        _min_req, natural_req = self.get_preferred_size()
+        allocated_width, allocated_height = self.get_size()
+        window_width = allocated_width if allocated_width > 1 else max(default_width, natural_req.width)
+        window_height = (
+            allocated_height if allocated_height > 1 else max(default_height, natural_req.height)
+        )
+
+        horizontal, vertical = self._get_preview_placement()
+
+        if horizontal == "center":
+            x_pos = geometry.x + max(0, (geometry.width - window_width) // 2)
+        elif horizontal == "right":
+            x_pos = geometry.x + max(
+                _PREVIEW_WINDOW_MARGIN_PX,
+                geometry.width - window_width - _PREVIEW_WINDOW_MARGIN_PX,
+            )
+        else:
+            x_pos = geometry.x + _PREVIEW_WINDOW_MARGIN_PX
+
+        if vertical == "middle":
+            y_pos = geometry.y + max(0, (geometry.height - window_height) // 2)
+        elif vertical == "bottom":
+            y_pos = geometry.y + max(
+                _PREVIEW_WINDOW_MARGIN_PX,
+                geometry.height - window_height - _PREVIEW_WINDOW_MARGIN_PX,
+            )
+        else:
+            y_pos = geometry.y + _PREVIEW_WINDOW_MARGIN_PX
+
+        logger.info(
+            "Positioning preview window at (%s, %s) using placement horizontal=%s vertical=%s.",
+            x_pos,
+            y_pos,
+            horizontal,
+            vertical,
+        )
+        self.move(x_pos, y_pos)
 
     def _refresh_ui(self) -> None:
         pending_available = bool(self.pending_text)

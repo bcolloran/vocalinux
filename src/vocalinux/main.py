@@ -384,7 +384,7 @@ def main():
             text_injector=text_system,
             action_handler=action_handler,
         )
-        preview_window = PreviewWindow(output_controller)
+        preview_window = PreviewWindow(output_controller, config_manager=config_manager)
 
         # --- Callback wiring ---------------------------------------------------
         # The speech engine emits three kinds of events, each handled by a

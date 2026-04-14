@@ -50,6 +50,9 @@ class TestConfigManager(unittest.TestCase):
         config_manager = ConfigManager()
         self.assertEqual(config_manager.config, DEFAULT_CONFIG)
         self.assertEqual(config_manager.config["shortcuts"]["mode"], "push_to_talk")
+        self.assertEqual(config_manager.config["preview_window"]["horizontal_placement"], "left")
+        self.assertEqual(config_manager.config["preview_window"]["vertical_placement"], "top")
+        self.assertEqual(config_manager.config["text_injection"]["typing_delay_ms"], 0)
         self.mock_logger.info.assert_called_with(
             f"Config file not found at {self.temp_config_file}. Using defaults."
         )
